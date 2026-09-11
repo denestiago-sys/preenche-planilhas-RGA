@@ -143,41 +143,14 @@ def extract_rga_signature(pages):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _extract_visao_geral_financeira(page0):
-    """Lê os cartões financeiros do topo do relatório (página 1) via crop de
-    coluna, usando os retângulos dos próprios cartões como referência —
-    evita o problema de valores intercalados no texto corrido."""
-    rects = page0.rects
-    # Agrupa retângulos por banda vertical (linha de cartões)
-    bands = {}
-    for r in rects:
-        h = r["bottom"] - r["top"]
-        if 30 < h < 90 and (r["x1"] - r["x0"]) > 60:
-            key = (round(r["top"]), round(r["bottom"]))
-            bands.setdefault(key, []).append(r)
+    """Lê os valores 'TOTAL DISPONIBILIZADO' e 'EXEC. FINANCEIRO TOTAL' do
+    topo do relatório (página 1), localizando o rótulo pela sequência exata
+    de palavras e pegando o valor 'R$...' logo abaixo dele — evita depender
+    de coordenadas fixas ou da ordem em que o texto corrido aparece."""
+    total_disp = _find_value_below_label(page0, ["TOTAL", "DISPONIBILIZADO"]) or ""
+    exec_val = _find_value_below_label(page0, ["EXEC.", "FINANCEIRO"]) or ""
 
-    total_disp = exec_val = ""
-    # Ordena bandas por posição vertical; a banda com 4 cartões contendo
-    # "TOTAL DISPONIBILIZADO" e "EXEC. FINANCEIRO" é a que interessa.
-    for (top, bottom), rs in sorted(bands.items()):
-        rs_sorted = sorted(rs, key=lambda r: r["x0"])
-        if len(rs_sorted) < 3:
-            continue
-        texts = [
-            _crop_text(page0, (r["x0"], top, r["x1"], bottom)) for r in rs_sorted
-        ]
-        joined = " ".join(texts)
-        if "TOTAL DISPONIBILIZADO" in joined and "FINANCEIRO TOTA" in joined:
-            for t in texts:
-                if "TOTAL DISPONIBILIZADO" in t:
-                    m = re.search(r"R\$[\d\.,]+", t)
-                    total_disp = m.group(0) if m else ""
-                if "FINANCEIRO TOTA" in t:
-                    m = re.search(r"R\$[\d\.,]+", t)
-                    exec_val = m.group(0) if m else ""
-            break
-
-    # Fallback: se os retângulos não seguirem o padrão esperado, tenta por
-    # rótulo em texto corrido com layout preservado.
+    # Recurso final (bem menos confiável): texto corrido com layout.
     if not total_disp or not exec_val:
         t = page0.extract_text(layout=True) or ""
         if not total_disp:
@@ -194,7 +167,7 @@ def _extract_meta_geral(pdf):
     p1 = pdf.pages[0]
     p2 = pdf.pages[1] if len(pdf.pages) > 1 else None
     t1 = p1.extract_text(layout=True) or ""
-    t2 = p2.extract_text(layout=True) if p2 else ""
+    words2 = p2.extract_words() if p2 else []
 
     # Descrição da Meta Geral
     desc_m = re.search(
@@ -204,32 +177,59 @@ def _extract_meta_geral(pdf):
 
     total_disp, exec_val = _extract_visao_geral_financeira(p1)
 
-    pol_m = re.search(r"Polaridade do Indicador:.*?(Quanto \w+, \w+)", t2)
+    pol_m = re.search(r"Polaridade do Indicador:.*?(Quanto \w+, \w+)",
+                       p2.extract_text(layout=True) if p2 else "")
     polaridade = pol_m.group(1) if pol_m else ""
 
-    exec_pct_m = re.search(r"([\d,\.]+%)\s*executado sobre o total disponibilizado", t2)
-    exec_pct = exec_pct_m.group(1) if exec_pct_m else ""
+    exec_pct = ""
+    idx = _seq_pos(words2, ["executado", "sobre"])
+    if idx:
+        exec_pct = words2[idx - 1]["text"]
 
-    sin_m = re.search(r"utilizando dados do Sinesp\?\s*\n?\s*(Sim|Não)", t2)
-    sinesp = sin_m.group(1).upper() if sin_m else ""
+    sinesp = ""
+    sin_label = _seq_pos(words2, ["Sinesp?"])
+    if sin_label is not None:
+        top_bound = words2[sin_label]["top"]
+        bottom_bound = top_bound + 20
+        sim_pos = next((w for w in words2 if w["text"] == "Sim"
+                         and top_bound <= w["top"] <= bottom_bound), None)
+        nao_pos = next((w for w in words2 if w["text"] == "Não"
+                         and top_bound <= w["top"] <= bottom_bound), None)
+        rows = []
+        if sim_pos:
+            rows.append(("SIM", sim_pos["x0"]))
+        if nao_pos:
+            rows.append(("NÃO", nao_pos["x0"]))
+        marker_x0 = None
+        for c in p2.curves:
+            if not c.get("fill"):
+                continue
+            color = c.get("non_stroking_color") or (1, 1, 1)
+            if all(v > 0.95 for v in color):
+                continue
+            w = c["x1"] - c["x0"]
+            h = c["bottom"] - c["top"]
+            if w < 10 and h < 10 and top_bound - 5 <= c["top"] <= bottom_bound:
+                marker_x0 = c["x0"]
+                break
+        if marker_x0 is not None and rows:
+            sinesp = min(rows, key=lambda r: abs(r[1] - marker_x0))[0]
 
-    pac_m = re.search(
-        r"Meta Geral Pactuada\s+Valor de Referência \(Apresentado.*?\):\s*\n\s*(\S+)\s+(\S+)",
-        t2,
-    )
-    meta_pac  = pac_m.group(1) if pac_m else ""
-    val_ref_p = pac_m.group(2) if pac_m else ""
+    idx = _seq_pos(words2, ["Meta", "Geral", "Pactuada"])
+    meta_pac = _value_below(words2, idx)
 
-    mon_m = re.search(
-        r"análise\):\s+Valor/Alcance da Meta Geral no exercício em análise \(%\):\s*\n\s*(\S+)\s+(\S+)",
-        t2,
-    )
-    val_ref_mon = mon_m.group(1) if mon_m else ""
-    val_alc     = mon_m.group(2) if mon_m else ""
+    idx = _seq_pos(words2, ["Valor", "de", "Referência", "(Apresentado"])
+    val_ref_p = _value_below(words2, idx)
+
+    idx = _seq_pos(words2, ["Valor", "de", "Referência", "(Monitorado"])
+    val_ref_mon = _value_below(words2, idx)
+
+    idx = _seq_pos(words2, ["Valor/Alcance", "da", "Meta", "Geral"])
+    val_alc = _value_below(words2, idx)
 
     alcance = ""
-    marco_14 = _word_top(p2, "1.4.", contains=False)
-    marco_15 = _word_top(p2, "1.5.", contains=False)
+    marco_14 = _word_top(p2, "1.4.", contains=False) if p2 else None
+    marco_15 = _word_top(p2, "1.5.", contains=False) if p2 else None
     if marco_14:
         top_bound = marco_14[1]
         bottom_bound = marco_15[1] if marco_15 else top_bound + 110
@@ -238,14 +238,6 @@ def _extract_meta_geral(pdf):
             sel = _detect_selected_option(p2, top_bound, bottom_bound, rows)
             if sel:
                 alcance = sel
-    if not alcance:
-        # Recurso: texto corrido (menos confiável — sempre "acha" a
-        # primeira opção listada, já que as 5 opções aparecem sempre).
-        sec14 = t2[t2.find("1.4."):] if "1.4." in t2 else ""
-        for opt in _ALCANCE_OPCOES:
-            if opt in sec14:
-                alcance = opt
-                break
 
     return {
         "descricao": (
@@ -281,12 +273,16 @@ def _resultado_from_pct(pct):
 def _detect_selected_option(page, top_bound, bottom_bound, rows):
     """Localiza qual opção de rádio está marcada dentro da faixa vertical
     [top_bound, bottom_bound]. No PDF, a opção marcada é desenhada com um
-    pequeno círculo preenchido (fill=True); as demais têm só o contorno.
+    pequeno círculo preenchido com cor sólida (não branca); as demais têm
+    só o contorno (ou um preenchimento branco de fundo, que é ignorado).
     `rows` é uma lista [(rótulo, top), ...] com a posição de cada opção."""
     marker_top = None
     for c in page.curves:
         if not c.get("fill"):
             continue
+        color = c.get("non_stroking_color") or (1, 1, 1)
+        if all(v > 0.95 for v in color):
+            continue  # preenchimento branco de fundo, não é a marcação
         w = c["x1"] - c["x0"]
         h = c["bottom"] - c["top"]
         if w < 10 and h < 10 and top_bound <= c["top"] <= bottom_bound:
@@ -318,6 +314,61 @@ def _alcance_option_rows(page, top_bound, bottom_bound):
     return list(zip(_ALCANCE_OPCOES, tops))
 
 
+def _seq_pos(words, seq, min_top=0):
+    """Retorna o índice em `words` onde começa a sequência exata de tokens
+    `seq` (ex.: ["Meta","Geral","Pactuada"]), a partir de min_top. Usado
+    para localizar rótulos sem depender de regex sobre texto corrido."""
+    n = len(seq)
+    for i in range(len(words) - n + 1):
+        if words[i]["top"] < min_top:
+            continue
+        if all(words[i + j]["text"] == seq[j] for j in range(n)):
+            return i
+    return None
+
+
+def _value_below(words, label_idx, dx=(-15, 60), dy=(4, 25)):
+    """A partir da posição de um rótulo (índice em `words`), acha o token
+    mais próximo posicionado logo abaixo dele (mesma coluna) — é assim que
+    os campos de valor aparecem no PDF, um pouco abaixo do rótulo."""
+    if label_idx is None:
+        return ""
+    lx, lt = words[label_idx]["x0"], words[label_idx]["top"]
+    best = None
+    for w in words:
+        if not (lt + dy[0] <= w["top"] <= lt + dy[1]):
+            continue
+        if not (lx + dx[0] <= w["x0"] <= lx + dx[1]):
+            continue
+        if best is None or w["top"] < best["top"]:
+            best = w
+    return best["text"] if best else ""
+
+
+def _find_value_below_label(page, label_words, value_regex=r"^R\$[\d\.,]+$",
+                             x_pad=(-10, 110), y_max=90, min_top=0):
+    """Localiza a sequência de tokens `label_words` e devolve o primeiro
+    token cujo texto bate com `value_regex`, posicionado abaixo do rótulo
+    e na mesma coluna (x0 próximo) — usado para os cartões financeiros,
+    que têm o valor exibido logo abaixo do título do cartão."""
+    words = page.extract_words()
+    idx = _seq_pos(words, label_words, min_top=min_top)
+    if idx is None:
+        return None
+    label_x0, label_top = words[idx]["x0"], words[idx]["top"]
+    best = None
+    for w in words:
+        if not re.match(value_regex, w["text"]):
+            continue
+        if w["top"] <= label_top or w["top"] - label_top > y_max:
+            continue
+        if not (label_x0 + x_pad[0] <= w["x0"] <= label_x0 + x_pad[1]):
+            continue
+        if best is None or w["top"] < best["top"]:
+            best = w
+    return best["text"] if best else None
+
+
 def _find_meta_titles(pdf, limit_page=None):
     """Localiza cada card 'META ESPECÍFICA N' (título em caixa alta) e
     devolve [(numero, page_idx, top), ...] em ordem."""
@@ -336,12 +387,25 @@ def _find_meta_titles(pdf, limit_page=None):
 def _extract_meta_especifica_avaliacao(pdf, num, page_idx, title_top, next_top_page, next_top):
     page = pdf.pages[page_idx]
     t = page.extract_text(layout=True) or ""
+    words = page.extract_words()
 
     # ─ Descrição (coluna esquerda, exclui a caixa de valores à direita) ─
-    desc = ""
+    # Bordas dinâmicas: esquerda = posição real do título "META ESPECÍFICA N"
+    # nesta página; direita = posição do rótulo "Total" (caixa de valores),
+    # menos uma margem. Evita depender de coordenadas fixas de página.
+    title_x0 = None
+    for w in words:
+        if w["text"] == "META" and abs(w["top"] - title_top) < 2:
+            title_x0 = w["x0"]
+            break
+    left = (title_x0 - 10) if title_x0 is not None else 184
+
+    total_word = _word_top(page, "Total", contains=False, min_top=title_top)
+    right = (total_word[0] - 15) if total_word else 490
+
     plan_word = _word_top(page, "Planejado:", contains=False, min_top=title_top)
     desc_bottom = plan_word[1] if plan_word else title_top + 60
-    desc_txt = _crop_text(page, (184, title_top + 6, 490, desc_bottom - 1))
+    desc_txt = _crop_text(page, (left, title_top + 6, right, desc_bottom - 1))
     desc = _clean(desc_txt)
 
     planejado_m = re.search(r"Planejado:\s*R?\$?\s*([\d\.,]+)", t)
