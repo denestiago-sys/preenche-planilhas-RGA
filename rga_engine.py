@@ -163,22 +163,46 @@ def _extract_visao_geral_financeira(page0):
     return total_disp, exec_val
 
 
+def _find_page_with_text(pdf, needle, start=0):
+    """Procura a primeira página (a partir de `start`) cujo texto contém
+    `needle`. Páginas intermediárias variam de quantidade dependendo do
+    conteúdo condicional do RGA (ex.: caixa de alerta de divergência
+    financeira), então o número de página nunca deve ser fixo — apenas a
+    presença de um texto-âncora estável é confiável."""
+    for pi in range(start, len(pdf.pages)):
+        text = pdf.pages[pi].extract_text() or ""
+        if needle in text:
+            return pi
+    return None
+
+
 def _extract_meta_geral(pdf):
     p1 = pdf.pages[0]
-    p2 = pdf.pages[1] if len(pdf.pages) > 1 else None
     t1 = p1.extract_text(layout=True) or ""
+
+    # A descrição/polaridade da Meta Geral normalmente está na página 0, mas
+    # quando o RGA traz a caixa de alerta "Executado da Gestão MENOR/MAIOR
+    # que o Executado Financeiro", esse bloco inteiro (descrição+polaridade)
+    # é empurrado para a página seguinte — por isso a busca é dinâmica.
+    desc_page_idx = _find_page_with_text(pdf, "META GERAL DO PLANO DE APLICAÇÃO")
+    desc_page = pdf.pages[desc_page_idx] if desc_page_idx is not None else p1
+    desc_text = desc_page.extract_text(layout=True) or t1
+
+    # Os campos numéricos (1.1 a 1.5) ficam em uma página própria, cujo
+    # índice também varia pelo mesmo motivo — nunca assumir pdf.pages[1].
+    meta_page_idx = _find_page_with_text(pdf, "Avaliação da Meta Geral")
+    p2 = pdf.pages[meta_page_idx] if meta_page_idx is not None else None
     words2 = p2.extract_words() if p2 else []
 
     # Descrição da Meta Geral
     desc_m = re.search(
-        r"META GERAL DO PLANO DE APLICAÇÃO\s*\n(.+?)(?:\n\s*Polaridade)", t1, re.DOTALL
+        r"META GERAL DO PLANO DE APLICAÇÃO\s*\n(.+?)(?:\n\s*Polaridade)", desc_text, re.DOTALL
     )
     descricao = _clean(desc_m.group(1)) if desc_m else ""
 
     total_disp, exec_val = _extract_visao_geral_financeira(p1)
 
-    pol_m = re.search(r"Polaridade do Indicador:.*?(Quanto \w+, \w+)",
-                       p2.extract_text(layout=True) if p2 else "")
+    pol_m = re.search(r"Polaridade do Indicador:.*?(Quanto \w+, \w+)", desc_text)
     polaridade = pol_m.group(1) if pol_m else ""
 
     exec_pct = ""
