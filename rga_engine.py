@@ -182,9 +182,9 @@ def _extract_meta_geral(pdf):
     polaridade = pol_m.group(1) if pol_m else ""
 
     exec_pct = ""
-    idx = _seq_pos(words2, ["executado", "sobre"])
-    if idx:
-        exec_pct = words2[idx - 1]["text"]
+    idx = _seq_pos(words2, ["sobre"])
+    if idx and idx >= 2:
+        exec_pct = words2[idx - 2]["text"]
 
     sinesp = ""
     sin_label = _seq_pos(words2, ["Sinesp?"])
@@ -428,7 +428,11 @@ def _extract_meta_especifica_avaliacao(pdf, num, page_idx, title_top, next_top_p
     pol_m = re.search(r"Polaridade do Indicador:.*?(Quanto \w+, \w+)", t)
     polaridade = pol_m.group(1) if pol_m else ""
 
-    sem_indicador = "não possui indicador mensurável" in t
+    sem_indicador = False
+    idx_chk = _seq_pos(words, ["Meta", "Específica", "não", "possui",
+                                "indicador", "mensurável"], min_top=title_top)
+    if idx_chk is not None and idx_chk > 0:
+        sem_indicador = words[idx_chk - 1]["text"] == "☑"
 
     # ─ Indicador / Fonte (crop em duas colunas) ─
     ind_word = _word_top(page, "Indicador", contains=False, min_top=title_top)
@@ -438,13 +442,31 @@ def _extract_meta_especifica_avaliacao(pdf, num, page_idx, title_top, next_top_p
     if ind_word and resultado_word:
         top0 = ind_word[1] + 9
         bottom0 = resultado_word[1] - 1
-        fonte_x0 = fonte_word[0] - 3 if fonte_word else 375
+        # A coluna "Fonte" nunca começa antes de ~x=300 no template deste
+        # relatório; um valor menor indica que a âncora "Fonte" encontrada
+        # não é a correta (ex.: outra ocorrência da palavra na página), e
+        # nesse caso é mais seguro cair no valor padrão do que produzir um
+        # corte que apaga o conteúdo do Indicador.
+        fonte_x0 = fonte_word[0] - 3 if (fonte_word and fonte_word[0] > 300) else 375
         indicador = _clean(_crop_text(page, (184, top0, fonte_x0, bottom0)))
         fonte     = _clean(_crop_text(page, (fonte_x0, top0, 571, bottom0)))
+        if not indicador and not fonte:
+            # Nenhuma das duas colunas rendeu texto: provavelmente top0/
+            # bottom0 não bateram com a linha certa. Tenta de novo com uma
+            # janela vertical mais generosa a partir do próprio rótulo.
+            bottom0 = ind_word[1] + 90
+            indicador = _clean(_crop_text(page, (184, top0, fonte_x0, bottom0)))
+            fonte     = _clean(_crop_text(page, (fonte_x0, top0, 571, bottom0)))
 
     # ─ Resultado alcançado (opção assinalada) ─
     resultado = ""
-    if resultado_word:
+    if sem_indicador:
+        # Quando a meta não possui indicador mensurável, o resultado
+        # correto é sempre "Não se aplica" — não depende de percentual de
+        # execução nem da marcação visual (que pode falhar dependendo de
+        # como o PDF foi gerado/renderizado).
+        resultado = "Não se aplica"
+    elif resultado_word:
         top_bound = resultado_word[1]
         bottom_bound = top_bound + 100
         rows = _alcance_option_rows(page, top_bound, bottom_bound)
@@ -459,7 +481,7 @@ def _extract_meta_especifica_avaliacao(pdf, num, page_idx, title_top, next_top_p
         "numero":             num,
         "polaridade":         polaridade,
         "exec_pct":           exec_pct_str,
-        "indicador":          indicador if not sem_indicador else indicador,
+        "indicador":          indicador,
         "fonte":              fonte,
         "meta_pactuada":      "",
         "val_ref_plano":      "",
