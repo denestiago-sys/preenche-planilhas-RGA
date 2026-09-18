@@ -28,26 +28,35 @@ MG_GAP_ROW    = 4
 ME_FIRST_TITLE_ROW = 5
 ME_BLOCK_HEIGHT    = 4
 
+# v3 (template atualizado, set/2026): a planilha-base trocou "PERCENTUAL DE
+# EXECUÇÃO FINANCEIRA" e "META [GERAL|ESPECÍFICA/AÇÃO] PACTUADA" por novos
+# campos — "INDICADOR DA META GERAL"/"FONTE DOS DADOS" na Meta Geral, e
+# "A AQUISIÇÃO/CONTRATAÇÃO FOI PREVISTA EM PLANO DE APLICAÇÃO?"/"HÁ VEDAÇÃO
+# EXPRESSA DO ITEM ADQUIRIDO?" na Meta Específica. Os dois campos novos de
+# cada bloco ainda não têm extração implementada (ver `indicador`/`fonte`
+# em MG_COLS e `aquisicao_prevista`/`vedacao_expressa` em ME_COLS) — o RGA
+# de referência usado até agora é de um formulário mais antigo que não os
+# traz, então ficam "" até termos um PDF de exemplo com esses campos.
 MG_COLS = {
     "descricao":         1,
     "polaridade":        2,
-    "exec_pct":          3,
-    "sinesp":            4,
-    "meta_pactuada":     5,
+    "indicador":         3,
+    "fonte":             4,
+    "sinesp":            5,
     "val_ref_plano":     6,
     "val_ref_monitorado":7,
     "val_alcance":       8,
-    "alcance":           10,
+    "resultado":         9,
 }
 
 ME_COLS = {
     "descricao":          1,
     "bens":               2,
-    "polaridade":         3,
-    "exec_pct":           4,
-    "indicador":          5,
-    "fonte":              6,
-    "meta_pactuada":      7,
+    "aquisicao_prevista": 3,
+    "vedacao_expressa":   4,
+    "polaridade":         5,
+    "indicador":          6,
+    "fonte":              7,
     "val_ref_plano":      8,
     "val_ref_monitorado": 9,
     "val_alcance":        10,
@@ -193,6 +202,7 @@ def _extract_meta_geral(pdf):
     meta_page_idx = _find_page_with_text(pdf, "Avaliação da Meta Geral")
     p2 = pdf.pages[meta_page_idx] if meta_page_idx is not None else None
     words2 = p2.extract_words() if p2 else []
+    t2 = p2.extract_text(layout=True) if p2 else ""
 
     # Descrição da Meta Geral
     desc_m = re.search(
@@ -204,11 +214,6 @@ def _extract_meta_geral(pdf):
 
     pol_m = re.search(r"Polaridade do Indicador:.*?(Quanto \w+, \w+)", desc_text)
     polaridade = pol_m.group(1) if pol_m else ""
-
-    exec_pct = ""
-    idx = _seq_pos(words2, ["sobre"])
-    if idx and idx >= 2:
-        exec_pct = words2[idx - 2]["text"]
 
     sinesp = ""
     sin_label = _seq_pos(words2, ["Sinesp?"])
@@ -239,8 +244,24 @@ def _extract_meta_geral(pdf):
         if marker_x0 is not None and rows:
             sinesp = min(rows, key=lambda r: abs(r[1] - marker_x0))[0]
 
-    idx = _seq_pos(words2, ["Meta", "Geral", "Pactuada"])
-    meta_pac = _value_below(words2, idx)
+    # 1.3. Valores da Meta Geral — checkbox "Plano não possui Meta Geral
+    # mensurável". Quando marcado, os 4 campos numéricos abaixo (Meta
+    # Pactuada / Valores de Referência / Valor-Alcance) e o alcance
+    # automático (1.4) não se aplicam; em seu lugar, o campo de texto livre
+    # "Demonstre se o objetivo está sendo alcançado (obrigatório)" é
+    # preenchido — ver _write_meta_geral, que mescla essas colunas.
+    sem_meta_mensuravel = _checkbox_marked(
+        words2, ["Plano", "não", "possui", "Meta", "Geral", "mensurável"]
+    )
+
+    demonstre = _extract_paragraph_after(
+        t2, r"Demonstre se o objetivo está sendo alcançado \(obrigatório\)",
+        [r"\n\s*1\.4\."],
+    )
+    observacoes = _extract_paragraph_after(
+        t2, r"1\.5\. Observações complementares \(opcional\)",
+        [r"\n\s*2\.\s"],
+    )
 
     idx = _seq_pos(words2, ["Valor", "de", "Referência", "(Apresentado"])
     val_ref_p = _value_below(words2, idx)
@@ -251,7 +272,7 @@ def _extract_meta_geral(pdf):
     idx = _seq_pos(words2, ["Valor/Alcance", "da", "Meta", "Geral"])
     val_alc = _value_below(words2, idx)
 
-    alcance = ""
+    resultado = ""
     marco_14 = _word_top(p2, "1.4.", contains=False) if p2 else None
     marco_15 = _word_top(p2, "1.5.", contains=False) if p2 else None
     if marco_14:
@@ -261,7 +282,17 @@ def _extract_meta_geral(pdf):
         if rows:
             sel = _detect_selected_option(p2, top_bound, bottom_bound, rows)
             if sel:
-                alcance = sel
+                resultado = sel
+
+    # TODO: "Indicador da Meta Geral" e "Fonte dos Dados" são campos novos
+    # do template (set/2026) que ainda não têm extração implementada — o
+    # RGA de referência usado até agora não os traz no formulário. Assim
+    # que houver um PDF de exemplo com esses campos, localizar o rótulo
+    # (provavelmente logo após a descrição/polaridade, no mesmo padrão já
+    # usado em _extract_meta_especifica_avaliacao para Indicador/Fonte da
+    # Meta Específica) e preencher aqui.
+    indicador = ""
+    fonte = ""
 
     return {
         "descricao": (
@@ -271,13 +302,16 @@ def _extract_meta_geral(pdf):
             f"    STATUS  EM EXECUÇÃO"
         ),
         "polaridade":         polaridade,
-        "exec_pct":           exec_pct,
+        "indicador":          indicador,
+        "fonte":              fonte,
         "sinesp":             sinesp,
-        "meta_pactuada":      meta_pac,
         "val_ref_plano":      val_ref_p,
         "val_ref_monitorado": val_ref_mon,
         "val_alcance":        val_alc,
-        "alcance":            alcance,
+        "resultado":          resultado,
+        "sem_meta_mensuravel": sem_meta_mensuravel,
+        "demonstre":          demonstre,
+        "observacoes":        observacoes,
     }
 
 
@@ -349,6 +383,60 @@ def _seq_pos(words, seq, min_top=0):
         if all(words[i + j]["text"] == seq[j] for j in range(n)):
             return i
     return None
+
+
+def _checkbox_marked(words, seq, min_top=0):
+    """Detecta se o checkbox (☑/☐) imediatamente antes da sequência de
+    tokens `seq` está marcado. Usado tanto para 'Plano não possui Meta
+    Geral mensurável' quanto para 'Meta Específica não possui indicador
+    mensurável' — o símbolo do checkbox é sempre o token anterior ao
+    rótulo, então basta localizar o rótulo e olhar um token pra trás."""
+    idx = _seq_pos(words, seq, min_top=min_top)
+    if idx is None or idx == 0:
+        return False
+    return words[idx - 1]["text"] == "☑"
+
+
+def _extract_paragraph_after(text, start_pattern, end_patterns=()):
+    """Captura o parágrafo de texto livre que aparece logo após um rótulo
+    (`start_pattern`, regex), até o primeiro dos `end_patterns` (regex) que
+    aparecer depois dele, ou até o fim do texto se nenhum aparecer. Usado
+    para campos de texto livre (justificativas/observações) cujo conteúdo
+    não tem tamanho fixo."""
+    m = re.search(start_pattern + r"\s*\n", text)
+    if not m:
+        return ""
+    rest = text[m.end():]
+    end_idx = len(rest)
+    for pat in end_patterns:
+        em = re.search(pat, rest)
+        if em and em.start() < end_idx:
+            end_idx = em.start()
+    return _clean(rest[:end_idx])
+
+
+def _combine_justificativa(demonstre, observacoes):
+    """Concatena o texto do campo obrigatório ('Demonstre se o objetivo
+    está sendo alcançado') com o do campo opcional ('Observações
+    complementares'), com um único espaço entre os dois quando ambos
+    existem (e sem espaço sobrando quando só um deles existe)."""
+    partes = [p.strip() for p in (demonstre, observacoes) if p and p.strip()]
+    return " ".join(partes)
+
+
+def _merge_row_range(ws, row, first_col, last_col, value):
+    """Mescla as células de `first_col` a `last_col` na linha `row` e grava
+    `value` na célula resultante. Remove antes qualquer mesclagem já
+    existente que se sobreponha ao intervalo (ex.: as mesclagens H:I / J:K
+    herdadas do template) — o openpyxl recusa criar uma mesclagem que
+    sobreponha uma mesclagem já existente."""
+    for rng in [r for r in list(ws.merged_cells.ranges)
+                if r.min_row <= row <= r.max_row
+                and not (r.max_col < first_col or r.min_col > last_col)]:
+        ws.unmerge_cells(str(rng))
+    ws.merge_cells(start_row=row, start_column=first_col,
+                    end_row=row, end_column=last_col)
+    ws.cell(row=row, column=first_col).value = value
 
 
 def _value_below(words, label_idx, dx=(-15, 60), dy=(4, 25)):
@@ -439,11 +527,13 @@ def _extract_meta_especifica_avaliacao(pdf, num, page_idx, title_top, next_top_p
     empenhado = empenhado_m.group(1) if empenhado_m else ""
     executado = executado_m.group(1) if executado_m else ""
 
+    # O template não tem mais uma coluna de "% de execução financeira", mas
+    # o percentual continua sendo usado internamente como fallback para
+    # decidir o "Resultado Alcançado" quando não dá pra ler a opção marcada
+    # no rádio (ver _resultado_from_pct abaixo).
     pct_m = re.search(r"([\d,\.]+)%\s+([\d,\.]+)%\s*\n?\s*Saldo:", t)
     exec_pct_num = None
-    exec_pct_str = ""
     if pct_m:
-        exec_pct_str = pct_m.group(2).replace(".", ",") + "%"
         try:
             exec_pct_num = float(pct_m.group(2).replace(",", "."))
         except ValueError:
@@ -452,11 +542,10 @@ def _extract_meta_especifica_avaliacao(pdf, num, page_idx, title_top, next_top_p
     pol_m = re.search(r"Polaridade do Indicador:.*?(Quanto \w+, \w+)", t)
     polaridade = pol_m.group(1) if pol_m else ""
 
-    sem_indicador = False
-    idx_chk = _seq_pos(words, ["Meta", "Específica", "não", "possui",
-                                "indicador", "mensurável"], min_top=title_top)
-    if idx_chk is not None and idx_chk > 0:
-        sem_indicador = words[idx_chk - 1]["text"] == "☑"
+    sem_indicador = _checkbox_marked(
+        words, ["Meta", "Específica", "não", "possui", "indicador", "mensurável"],
+        min_top=title_top,
+    )
 
     # ─ Indicador / Fonte (crop em duas colunas) ─
     ind_word = _word_top(page, "Indicador", contains=False, min_top=title_top)
@@ -472,14 +561,19 @@ def _extract_meta_especifica_avaliacao(pdf, num, page_idx, title_top, next_top_p
         # nesse caso é mais seguro cair no valor padrão do que produzir um
         # corte que apaga o conteúdo do Indicador.
         fonte_x0 = fonte_word[0] - 3 if (fonte_word and fonte_word[0] > 300) else 375
-        indicador = _clean(_crop_text(page, (184, top0, fonte_x0, bottom0)))
+        # Margem esquerda: mesma usada para a descrição (`left`, derivada da
+        # posição real do título nesta página) em vez de um valor fixo — um
+        # valor fixo (184) cortava o início do texto quando o conteúdo desta
+        # coluna começa mais à esquerda (visto em relatórios com a caixa
+        # "Meta Específica não possui indicador mensurável" marcada).
+        indicador = _clean(_crop_text(page, (left, top0, fonte_x0, bottom0)))
         fonte     = _clean(_crop_text(page, (fonte_x0, top0, 571, bottom0)))
         if not indicador and not fonte:
             # Nenhuma das duas colunas rendeu texto: provavelmente top0/
             # bottom0 não bateram com a linha certa. Tenta de novo com uma
             # janela vertical mais generosa a partir do próprio rótulo.
             bottom0 = ind_word[1] + 90
-            indicador = _clean(_crop_text(page, (184, top0, fonte_x0, bottom0)))
+            indicador = _clean(_crop_text(page, (left, top0, fonte_x0, bottom0)))
             fonte     = _clean(_crop_text(page, (fonte_x0, top0, 571, bottom0)))
 
     # ─ Resultado alcançado (opção assinalada) ─
@@ -501,17 +595,41 @@ def _extract_meta_especifica_avaliacao(pdf, num, page_idx, title_top, next_top_p
     if not resultado:
         resultado = _resultado_from_pct(exec_pct_num)
 
+    # Justificativa (texto livre) — quando a meta não possui indicador
+    # mensurável, o campo obrigatório "Demonstre se o objetivo está sendo
+    # alcançado" é o parágrafo que aparece logo após a última opção do
+    # rádio de resultado ("Não se aplica"), até o início da próxima Meta
+    # Específica ou da seção seguinte do relatório.
+    justificativa = ""
+    if sem_indicador:
+        justificativa = _extract_paragraph_after(
+            t, r"Não se aplica",
+            [r"\n\s*META\s+ESPECÍFICA\s+\d", r"\n\s*3\.\s"],
+        )
+
+    # TODO: "A aquisição/contratação foi prevista em Plano de Aplicação?" e
+    # "Há vedação expressa do item adquirido?" são campos novos do template
+    # (set/2026) que ainda não têm extração implementada — o RGA de
+    # referência usado até agora não os traz no formulário. Assim que
+    # houver um PDF de exemplo com esses campos, localizar o(s) rótulo(s) e
+    # preencher aqui (podem ser por Meta Específica, ou por item da tabela
+    # 6.1 "Detalhamento dos Itens" — precisa confirmar no PDF real).
+    aquisicao_prevista = ""
+    vedacao_expressa = ""
+
     return {
         "numero":             num,
         "polaridade":         polaridade,
-        "exec_pct":           exec_pct_str,
         "indicador":          indicador,
         "fonte":              fonte,
-        "meta_pactuada":      "",
+        "aquisicao_prevista": aquisicao_prevista,
+        "vedacao_expressa":   vedacao_expressa,
         "val_ref_plano":      "",
         "val_ref_monitorado": "",
         "val_alcance":        "",
         "resultado":          resultado,
+        "sem_indicador":      sem_indicador,
+        "justificativa":      justificativa,
         "bens":               [],
         "_desc":              desc,
         "_plan":              planejado,
@@ -879,6 +997,19 @@ def _copy_merged_ranges(ws_src, r_src, ws_dst, r_dst):
                 pass
 
 
+# Colunas de valor/resultado da Meta Geral que, quando "Plano não possui
+# Meta Geral mensurável" está marcado, são mescladas numa única célula com
+# o texto de justificativa (ver _write_meta_geral). Corresponde às colunas
+# F, G, H e I do template atual (Valor Ref. Apresentado/Monitorado,
+# Valor/Alcance e Resultado Alcançado) — colunas contíguas, sem espaçador.
+_MG_MERGE_KEYS = ("val_ref_plano", "val_ref_monitorado",
+                   "val_alcance", "resultado")
+
+# Colunas equivalentes na tabela de Meta Específica (H a K — contíguas).
+_ME_MERGE_KEYS = ("val_ref_plano", "val_ref_monitorado",
+                   "val_alcance", "resultado")
+
+
 def _write_meta_geral(ws, mg, tmpl_ws):
     for r_src, r_dst in [(MG_TITLE_ROW, MG_TITLE_ROW),
                          (MG_HEADER_ROW, MG_HEADER_ROW),
@@ -889,8 +1020,16 @@ def _write_meta_geral(ws, mg, tmpl_ws):
     for r in [MG_TITLE_ROW, MG_HEADER_ROW, MG_DATA_ROW]:
         _copy_merged_ranges(tmpl_ws, r, ws, r)
 
+    sem_mensuravel = mg.get("sem_meta_mensuravel")
     for key, col in MG_COLS.items():
+        if sem_mensuravel and key in _MG_MERGE_KEYS:
+            continue
         ws.cell(row=MG_DATA_ROW, column=col).value = mg.get(key, "")
+
+    if sem_mensuravel:
+        texto = _combine_justificativa(mg.get("demonstre"), mg.get("observacoes"))
+        _merge_row_range(ws, MG_DATA_ROW, MG_COLS["val_ref_plano"],
+                          MG_COLS["resultado"], texto)
 
 
 def _write_meta_especifica(ws, meta, block_idx, tmpl_ws):
@@ -904,9 +1043,16 @@ def _write_meta_especifica(ws, meta, block_idx, tmpl_ws):
         _copy_merged_ranges(tmpl_ws, r_src, ws, r_dst)
 
     dr = base + 2
+    sem_indicador = meta.get("sem_indicador")
     for key, col in ME_COLS.items():
-        val = meta.get(key, "")
-        ws.cell(row=dr, column=col).value = val
+        if sem_indicador and key in _ME_MERGE_KEYS:
+            continue
+        ws.cell(row=dr, column=col).value = meta.get(key, "")
+
+    if sem_indicador:
+        texto = _combine_justificativa(meta.get("justificativa"), meta.get("observacoes"))
+        _merge_row_range(ws, dr, ME_COLS["val_ref_plano"],
+                          ME_COLS["resultado"], texto)
 
 
 def generate_rga_excel_bytes(template_path: Path, meta_geral: dict, metas: list) -> bytes:
@@ -944,20 +1090,41 @@ def get_missing_cells(meta_geral: dict, metas: list) -> list:
 
     chk("Meta Geral › Descrição",          meta_geral.get("descricao"))
     chk("Meta Geral › Polaridade",         meta_geral.get("polaridade"))
-    chk("Meta Geral › % Execução",         meta_geral.get("exec_pct"))
+    # Indicador/Fonte da Meta Geral: campos novos do template, extração
+    # ainda não implementada (ver TODO em _extract_meta_geral) — ficam
+    # sempre "" por ora, e por isso sempre aparecem aqui até serem
+    # implementados. Isso é esperado, não um bug.
+    chk("Meta Geral › Indicador",          meta_geral.get("indicador"))
+    chk("Meta Geral › Fonte",              meta_geral.get("fonte"))
     chk("Meta Geral › Sinesp",             meta_geral.get("sinesp"))
-    chk("Meta Geral › Meta Pactuada",      meta_geral.get("meta_pactuada"))
-    chk("Meta Geral › Valor Ref. Plano",   meta_geral.get("val_ref_plano"))
-    chk("Meta Geral › Valor Ref. Mon.",    meta_geral.get("val_ref_monitorado"))
-    chk("Meta Geral › Valor/Alcance",      meta_geral.get("val_alcance"))
-    chk("Meta Geral › Alcance Pactuado",   meta_geral.get("alcance"))
+    if meta_geral.get("sem_meta_mensuravel"):
+        # Os campos de valor foram mesclados com o texto de justificativa
+        # ("Demonstre se o objetivo está sendo alcançado" + "Observações
+        # complementares") — checar esse texto em vez de cada campo
+        # individual, que fica em branco propositalmente nesse caso.
+        chk("Meta Geral › Demonstre objetivo alcançado",
+            _combine_justificativa(meta_geral.get("demonstre"), meta_geral.get("observacoes")))
+    else:
+        chk("Meta Geral › Valor Ref. Plano",   meta_geral.get("val_ref_plano"))
+        chk("Meta Geral › Valor Ref. Mon.",    meta_geral.get("val_ref_monitorado"))
+        chk("Meta Geral › Valor/Alcance",      meta_geral.get("val_alcance"))
+        chk("Meta Geral › Resultado Alcançado", meta_geral.get("resultado"))
 
     for m in metas:
         n = m.get("numero", "?")
         chk(f"Meta {n} › Indicador",       m.get("indicador"))
         chk(f"Meta {n} › Fonte",           m.get("fonte"))
-        chk(f"Meta {n} › Val. Ref. Mon.",  m.get("val_ref_monitorado"))
-        chk(f"Meta {n} › Valor/Alcance",   m.get("val_alcance"))
-        chk(f"Meta {n} › Resultado",       m.get("resultado"))
+        # Aquisição prevista/Vedação expressa: campos novos do template,
+        # extração ainda não implementada (ver TODO em
+        # _extract_meta_especifica_avaliacao) — mesmo caso do Indicador/
+        # Fonte da Meta Geral acima.
+        chk(f"Meta {n} › Aquisição Prevista", m.get("aquisicao_prevista"))
+        chk(f"Meta {n} › Vedação Expressa",   m.get("vedacao_expressa"))
+        if m.get("sem_indicador"):
+            chk(f"Meta {n} › Demonstre objetivo alcançado", m.get("justificativa"))
+        else:
+            chk(f"Meta {n} › Val. Ref. Mon.",  m.get("val_ref_monitorado"))
+            chk(f"Meta {n} › Valor/Alcance",   m.get("val_alcance"))
+            chk(f"Meta {n} › Resultado",       m.get("resultado"))
 
     return missing
