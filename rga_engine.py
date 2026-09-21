@@ -1046,21 +1046,21 @@ def _extract_bens_por_meta(pdf):
             npi, ntop = end
         items = _extract_items_for_range(pdf, pi, top, npi, ntop, cols=cols)
         if ano_exercicio:
-            # Fonte da verdade: a própria coluna "Itens Adquiridos" traz o
-            # ano em que o item foi adquirido (ou "Nenhum"). Só entram os
-            # itens cujo ano bate com o exercício financeiro deste RGA.
-            # Um item começando com "Nenhum" nunca conta como adquirido —
-            # mesmo que o crop tenha vazado texto do item seguinte pra
-            # dentro da mesma célula (linhas próximas na tabela), o que
-            # faria o ano aparecer como substring mesmo sem pertencer a
-            # este item.
-            def _foi_adquirido(it):
-                txt = (it.get("itens_adquiridos") or "").strip()
-                if txt.startswith("Nenhum"):
-                    return False
-                return ano_exercicio in txt
-
-            adquiridos = [it for it in items if _foi_adquirido(it)]
+            # A coluna "Ano Exec." (já extraída em "ano_exec") é o sinal
+            # confiável de que um item foi de fato adquirido num ano
+            # específico — ao contrário da coluna "Itens Adquiridos", cujo
+            # texto livre (ano + detalhes da aquisição) pode, no PDF, ser
+            # desenhado começando um pouco ACIMA da própria linha do item
+            # a que pertence (quando os itens vizinhos têm células curtas
+            # tipo "Nenhum" logo acima, sobra espaço em branco na coluna e
+            # o texto seguinte "sobe" pra preencher, mesmo pertencendo ao
+            # próximo item) — confirmado comparando as duas versões reais
+            # do RGA AC|RMVI|2023. "Ano Exec." não tem esse problema: fica
+            # sempre alinhado com a linha certa do item.
+            adquiridos = [
+                it for it in items
+                if it.get("ano_exec") == ano_exercicio
+            ]
         else:
             # Não foi possível achar o ano do exercício no cabeçalho —
             # volta pro critério antigo (valor executado/empenhado > 0)
