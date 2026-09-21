@@ -215,6 +215,25 @@ def _find_page_with_text(pdf, needle, start=0):
     return None
 
 
+def _collect_text_until(pdf, start_idx, stop_pattern, max_pages=8):
+    """Concatena o texto (layout=True) de `start_idx` em diante — pra
+    campos de texto livre longos o bastante pra continuar na página
+    seguinte (ex.: "1.5. Observações complementares", que pode ocupar
+    mais de uma página) — parando (inclusive) na primeira página
+    seguinte que contenha `stop_pattern`, já que esse padrão marca o
+    início da próxima seção do RGA e não deve ser ultrapassado à toa.
+    `max_pages` é só uma salvaguarda contra concatenar o PDF inteiro
+    caso o padrão nunca apareça."""
+    parts = []
+    for pi in range(start_idx, min(start_idx + max_pages, len(pdf.pages))):
+        page = pdf.pages[pi]
+        t = page.extract_text(layout=True) or ""
+        parts.append(t)
+        if pi > start_idx and re.search(stop_pattern, t):
+            break
+    return "\n".join(parts)
+
+
 def _extract_meta_geral(pdf):
     p1 = pdf.pages[0]
     t1 = p1.extract_text(layout=True) or ""
@@ -232,7 +251,15 @@ def _extract_meta_geral(pdf):
     meta_page_idx = _find_page_with_text(pdf, "Avaliação da Meta Geral")
     p2 = pdf.pages[meta_page_idx] if meta_page_idx is not None else None
     words2 = p2.extract_words() if p2 else []
-    t2 = p2.extract_text(layout=True) if p2 else ""
+    # "1.5. Observações complementares" pode ser um texto longo que
+    # continua na(s) página(s) seguinte(s) — uma só página não basta.
+    # Junta o texto de meta_page_idx em diante até (e incluindo) a
+    # página onde aparece "2. Desempenho das Metas Específicas", que é
+    # o limite real da seção 1 (ver _extract_paragraph_after abaixo, que
+    # corta exatamente nesse ponto).
+    t2 = _collect_text_until(
+        pdf, meta_page_idx, r"2\.\s*Desempenho\s+das\s+Metas\s+Específicas"
+    ) if p2 else ""
 
     # Descrição da Meta Geral
     desc_m = re.search(
@@ -471,10 +498,11 @@ def _extract_paragraph_after(text, start_pattern, end_patterns=()):
 def _combine_justificativa(demonstre, observacoes):
     """Concatena o texto do campo obrigatório ('Demonstre se o objetivo
     está sendo alcançado') com o do campo opcional ('Observações
-    complementares'), com um único espaço entre os dois quando ambos
-    existem (e sem espaço sobrando quando só um deles existe)."""
+    complementares'), pulando uma linha entre os dois quando ambos
+    existem — são dois campos distintos do formulário, não uma frase
+    só — e sem linha em branco sobrando quando só um deles existe."""
     partes = [p.strip() for p in (demonstre, observacoes) if p and p.strip()]
-    return " ".join(partes)
+    return "\n\n".join(partes)
 
 
 def _merge_row_range(ws, row, first_col, last_col, value):
