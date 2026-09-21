@@ -105,16 +105,49 @@ def _safe_bbox(page, x0, top, x1, bottom):
     return (x0, top, x1, bottom)
 
 
+def _words_in_bbox(page, bbox):
+    """Retorna as palavras cujo CENTRO vertical cai dentro da bbox
+    (x0, top, x1, bottom) e que têm alguma sobreposição horizontal com
+    ela — ao contrário de `page.within_bbox()`, que exige a palavra
+    inteira (topo E base) contida na caixa. Isso importa porque bandas
+    de linha consecutivas (ex.: o final da célula de um item e o
+    começo da célula do próximo, na tabela "6.1 Detalhamento dos Itens
+    por Meta Específica") são fatiadas exatamente na fronteira entre
+    elas; com `within_bbox`, uma palavra bem na borda pode ter o topo
+    dentro de uma banda mas a base vazando pra fora (ou vice-versa) e
+    acabar excluída DAS DUAS bandas — some do texto extraído. Cortar
+    pelo centro elimina essa zona-morta: cada palavra cai em exatamente
+    uma banda."""
+    x0, top, x1, bottom = bbox
+    out = []
+    for w in page.extract_words():
+        if w["x1"] < x0 or w["x0"] > x1:
+            continue
+        center = (w["top"] + w["bottom"]) / 2
+        if top <= center < bottom:
+            out.append(w)
+    return out
+
+
 def _crop_text(page, bbox):
-    """Extrai texto de uma região retangular (x0, top, x1, bottom) da página,
-    limitando aos limites reais da página para evitar erro do pdfplumber."""
+    """Extrai texto de uma região retangular (x0, top, x1, bottom) da
+    página (ver `_words_in_bbox`), limitando aos limites reais da
+    página para evitar erro do pdfplumber. Reconstrói linhas juntando
+    palavras pelo "top" arredondado, na ordem horizontal."""
     safe = _safe_bbox(page, *bbox)
     if safe is None:
         return ""
-    try:
-        return page.within_bbox(safe).extract_text() or ""
-    except Exception:
+    words = _words_in_bbox(page, safe)
+    if not words:
         return ""
+    lines = {}
+    for w in words:
+        lines.setdefault(round(w["top"], 1), []).append(w)
+    partes = []
+    for t in sorted(lines):
+        ws = sorted(lines[t], key=lambda w: w["x0"])
+        partes.append(" ".join(w["text"] for w in ws))
+    return "\n".join(partes)
 
 
 def _crop_words(page, bbox):
@@ -122,10 +155,7 @@ def _crop_words(page, bbox):
     safe = _safe_bbox(page, *bbox)
     if safe is None:
         return []
-    try:
-        return page.within_bbox(safe).extract_words()
-    except Exception:
-        return []
+    return _words_in_bbox(page, safe)
 
 
 def _word_top(page, text, contains=False, min_top=0):
@@ -975,6 +1005,49 @@ def _extract_items_for_range(pdf, start_page, start_top, end_page, end_top, cols
             "ano_exec":          ano,
             "itens_adquiridos":  itens_adquiridos,
         })
+
+    # A célula "Itens Adquiridos" de um item pode, na prática, terminar
+    # com um pedacinho de texto que na verdade pertence ao PRÓXIMO item
+    # (ex.: o rótulo de ano "2025" de uma aquisição cujo restante —
+    # descrição, "Qtd:", "Total:" — só aparece na linha seguinte da
+    # tabela). Isso acontece porque a coluna é cortada exatamente na
+    # borda entre as bandas de cada item, e esse pedaço solto (sem
+    # "Qtd:.../Total:..." próprio) fica sobrando no final da banda de
+    # cima. Aqui, qualquer sobra DEPOIS do último "Qtd:.../Total:..."
+    # reconhecido é passada pro início do próximo item, onde de fato
+    # pertence.
+    for i in range(len(items) - 1):
+        txt = items[i]["itens_adquiridos"]
+        if not txt:
+            continue
+        if txt.startswith("Nenhum"):
+            # Célula própria é "Nenhum" — qualquer coisa depois disso só
+            # pode ser sobra de baixo (bleed do próximo item), nunca
+            # conteúdo deste. Passa tudo adiante.
+            sobra = txt[len("Nenhum"):].strip()
+            if not sobra:
+                continue
+            items[i]["itens_adquiridos"] = "Nenhum"
+            prox = items[i + 1]["itens_adquiridos"]
+            prox = "" if prox.startswith("Nenhum") else prox
+            items[i + 1]["itens_adquiridos"] = _clean(sobra + " " + prox)
+            continue
+        matches = list(_QTD_TOTAL_RE.finditer(txt))
+        if matches:
+            sobra = txt[matches[-1].end():].strip()
+            if sobra:
+                items[i]["itens_adquiridos"] = txt[:matches[-1].end()].strip()
+                prox = items[i + 1]["itens_adquiridos"]
+                prox = "" if prox.startswith("Nenhum") else prox
+                items[i + 1]["itens_adquiridos"] = _clean(sobra + " " + prox)
+        else:
+            # não tem nenhum par Qtd/Total — o texto inteiro (ex.: só o
+            # rótulo de ano) pertence ao próximo item.
+            items[i]["itens_adquiridos"] = "Nenhum"
+            prox = items[i + 1]["itens_adquiridos"]
+            prox = "" if prox.startswith("Nenhum") else prox
+            items[i + 1]["itens_adquiridos"] = _clean(txt + " " + prox)
+
     return items
 
 
