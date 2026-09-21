@@ -1015,11 +1015,22 @@ def _parse_itens_adquiridos(raw):
     """Quebra o texto livre da coluna 'Itens Adquiridos' (seção 6.1 do
     RGA) em uma lista de aquisições individuais. Um mesmo item planejado
     pode ter mais de uma aquisição vinculada (ex.: munição comprada em
-    vários lotes/notas fiscais) — cada uma aparece no PDF como
-    "<descrição/detalhes> Qtd: N Total: R$X", podendo se repetir várias
-    vezes na mesma célula. Devolve uma lista de dicts
-    {"descricao", "qtd", "total"}; lista vazia se a célula for "Nenhum"
-    ou não tiver nenhum padrão Qtd/Total reconhecível."""
+    vários lotes/notas fiscais, ou um bem "vinculado a outro item
+    planejado" — ver legenda da seção) — cada uma aparece no PDF como
+    "[ano] <descrição/detalhes> Qtd: N Total: R$X", podendo se repetir
+    várias vezes na mesma célula.
+
+    O rótulo de ano que antecede cada aquisição é o que diz em que ano
+    ela foi de fato adquirida — pode diferir do "Ano Exec." da própria
+    linha do item (ex.: uma munição com "Ano Exec." 2025 mas cujo lote
+    específico, no texto de 'Itens Adquiridos', está rotulado "2024" —
+    aquisição de um exercício anterior, não deste RGA). Só um novo
+    rótulo de ano reinicia o "ano corrente"; aquisições seguintes sem
+    rótulo próprio herdam o último ano visto na célula.
+
+    Devolve uma lista de dicts {"descricao", "qtd", "total", "ano"};
+    lista vazia se a célula for "Nenhum" ou não tiver nenhum padrão
+    Qtd/Total reconhecível."""
     if not raw:
         return []
     text = raw.strip()
@@ -1031,28 +1042,40 @@ def _parse_itens_adquiridos(raw):
 
     entries = []
     pos = 0
+    ano_atual = None
     for m in _QTD_TOTAL_RE.finditer(text):
         desc = _clean(text[pos:m.start()])
-        # tira o rótulo de ano (ex.: "2025 ") do início da 1ª descrição
-        desc = re.sub(r"^20\d{2}\s+", "", desc)
+        ano_m = re.match(r"^(20\d{2})\b", desc)
+        if ano_m:
+            ano_atual = ano_m.group(1)
+            desc = _clean(desc[ano_m.end():])
         # valores não devem ter espaço interno (artefato de quebra de
         # linha no meio do número, ex.: "R$99.840,0 0" → "R$99.840,00")
         total = re.sub(r"\s+", "", m.group(2))
         qtd = re.sub(r"\s+", "", m.group(1))
-        entries.append({"descricao": desc, "qtd": qtd, "total": total})
+        entries.append({"descricao": desc, "qtd": qtd, "total": total, "ano": ano_atual})
         pos = m.end()
     return entries
 
 
-def _format_aquisicao_entries(item):
+def _format_aquisicao_entries(item, ano_exercicio=None):
     """Formata as aquisições vinculadas a este item planejado, uma por
     bloco de 3 linhas (nome do item adquirido / Qtd: N / Total: R$X),
     lidas da própria coluna 'Itens Adquiridos' do RGA — não do nome do
-    item planejado. Se não der pra reconhecer nenhuma aquisição no
-    texto, cai de volta numa linha-resumo (ver `_format_bem_line_fallback`)
-    pra não perder o item da lista."""
+    item planejado. Quando `ano_exercicio` é informado, só entram as
+    aquisições cujo próprio rótulo de ano (dentro da célula) bate com o
+    ano do exercício financeiro deste RGA — mesmo que outras aquisições
+    do MESMO item planejado sejam de anos diferentes. Se não der pra
+    reconhecer nenhuma aquisição no texto, cai de volta numa
+    linha-resumo (ver `_format_bem_line_fallback`) só quando não há
+    filtro de ano ativo, pra não inventar uma aquisição no ano certo a
+    partir de um item cujo texto não deu pra interpretar."""
     entries = _parse_itens_adquiridos(item.get("itens_adquiridos", ""))
-    if not entries:
+    if ano_exercicio:
+        entries = [e for e in entries if e.get("ano") == ano_exercicio]
+        if not entries:
+            return []
+    elif not entries:
         return [_format_bem_line_fallback(item)]
     blocos = []
     for e in entries:
@@ -1076,14 +1099,16 @@ def _find_report_year(pdf):
 
 def _extract_bens_por_meta(pdf):
     """Localiza a seção '6.1. Detalhamento dos Itens por Meta Específica' e
-    extrai, para cada Meta Específica, a lista de itens efetivamente
-    adquiridos NO ANO DA PRESTAÇÃO DE CONTAS (o "Exercício Financeiro" do
-    cabeçalho do RGA) — conforme a própria coluna "Itens Adquiridos" da
-    tabela, que traz o ano da aquisição (ou "Nenhum" quando o item
-    planejado não teve nenhum bem/serviço vinculado a ele). Antes disso,
-    calibra as colunas da tabela a partir da primeira linha de item da
-    primeira Meta Específica (ver `_detect_item_columns`), já que a
-    posição das colunas varia entre relatórios."""
+    extrai, para cada Meta Específica, a lista de aquisições efetivamente
+    feitas NO ANO DA PRESTAÇÃO DE CONTAS (o "Exercício Financeiro" do
+    cabeçalho do RGA) — conforme o próprio rótulo de ano que antecede
+    cada aquisição na coluna "Itens Adquiridos" (ver `_parse_itens_adquiridos`).
+    Um mesmo item planejado pode ter aquisições de anos diferentes
+    vinculadas a ele (ex.: um lote de munição de 2024 e outro de 2025) —
+    só entram no resultado as do ano do exercício deste RGA. Antes
+    disso, calibra as colunas da tabela a partir da primeira linha de
+    item da primeira Meta Específica (ver `_detect_item_columns`), já
+    que a posição das colunas varia entre relatórios."""
     idx_page = None
     for pi, page in enumerate(pdf.pages):
         text = page.extract_text() or ""
@@ -1109,34 +1134,28 @@ def _extract_bens_por_meta(pdf):
             npi, ntop = end
         items = _extract_items_for_range(pdf, pi, top, npi, ntop, cols=cols)
         if ano_exercicio:
-            # A coluna "Ano Exec." (já extraída em "ano_exec") é o sinal
-            # confiável de que um item foi de fato adquirido num ano
-            # específico — ao contrário da coluna "Itens Adquiridos", cujo
-            # texto livre (ano + detalhes da aquisição) pode, no PDF, ser
-            # desenhado começando um pouco ACIMA da própria linha do item
-            # a que pertence (quando os itens vizinhos têm células curtas
-            # tipo "Nenhum" logo acima, sobra espaço em branco na coluna e
-            # o texto seguinte "sobe" pra preencher, mesmo pertencendo ao
-            # próximo item) — confirmado comparando as duas versões reais
-            # do RGA AC|RMVI|2023. "Ano Exec." não tem esse problema: fica
-            # sempre alinhado com a linha certa do item.
-            adquiridos = [
-                it for it in items
-                if it.get("ano_exec") == ano_exercicio
-            ]
+            # O ano de cada aquisição é decidido dentro de
+            # _format_aquisicao_entries, a partir do rótulo de ano que
+            # antecede cada uma na própria coluna "Itens Adquiridos" —
+            # não pelo "Ano Exec." da linha (que pode não bater: uma
+            # munição com "Ano Exec." 2025 pode ter, dentro da célula,
+            # um lote rotulado "2024" que não é deste RGA). Por isso
+            # passa por TODOS os itens (não só os com ano_exec batendo),
+            # e o filtro por ano acontece aquisição a aquisição.
+            candidatos = items
         else:
             # Não foi possível achar o ano do exercício no cabeçalho —
             # volta pro critério antigo (valor executado/empenhado > 0)
             # como salvaguarda, em vez de não trazer nada.
-            adquiridos = [
+            candidatos = [
                 it for it in items
                 if (it["pct_exec"] or 0) > 0
                 or _to_float(it["vol_executado"]) > 0
                 or _to_float(it["vl_empenhado"]) > 0
             ]
         blocos = []
-        for it in adquiridos:
-            blocos.extend(_format_aquisicao_entries(it))
+        for it in candidatos:
+            blocos.extend(_format_aquisicao_entries(it, ano_exercicio=ano_exercicio))
         bens_por_meta[num] = blocos
     return bens_por_meta
 
