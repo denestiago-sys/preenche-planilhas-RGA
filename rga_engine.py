@@ -978,7 +978,10 @@ def _extract_items_for_range(pdf, start_page, start_top, end_page, end_top, cols
     return items
 
 
-def _format_bem_line(item):
+def _format_bem_line_fallback(item):
+    """Linha-resumo usada só quando não dá pra reconhecer nenhuma
+    aquisição individual no texto de 'itens_adquiridos' (formato
+    inesperado) — pra não deixar a célula vazia mesmo assim."""
     partes = [f"- {item['descricao']}"]
     if item.get("orgao"):
         partes.append(f"({item['orgao']})")
@@ -996,6 +999,66 @@ def _format_bem_line(item):
     if detalhe:
         partes.append("— " + "; ".join(detalhe))
     return " ".join(partes)
+
+
+# O valor em R$ pode ter espaços espúrios espalhados por dentro do
+# número (não só logo após "R$") — artefato de quebra de linha no meio
+# do próprio número na coluna "Itens Adquiridos" (coluna muito estreita
+# no PDF, quebra em qualquer ponto). Ex.: "R$99.840,0 0" no lugar de
+# "R$99.840,00". Por isso o padrão aceita espaço opcional entre
+# QUALQUER dígito/separador do valor, não só um espaço fixo após "R$".
+_MONEY_RE = r"R\$\s?(?:[\d\.]\s?)+,\s?\d\s?\d"
+_QTD_TOTAL_RE = re.compile(rf"Qtd:\s*([\d\.,\s]+?)\s*Total:\s*({_MONEY_RE})")
+
+
+def _parse_itens_adquiridos(raw):
+    """Quebra o texto livre da coluna 'Itens Adquiridos' (seção 6.1 do
+    RGA) em uma lista de aquisições individuais. Um mesmo item planejado
+    pode ter mais de uma aquisição vinculada (ex.: munição comprada em
+    vários lotes/notas fiscais) — cada uma aparece no PDF como
+    "<descrição/detalhes> Qtd: N Total: R$X", podendo se repetir várias
+    vezes na mesma célula. Devolve uma lista de dicts
+    {"descricao", "qtd", "total"}; lista vazia se a célula for "Nenhum"
+    ou não tiver nenhum padrão Qtd/Total reconhecível."""
+    if not raw:
+        return []
+    text = raw.strip()
+    if text.startswith("Nenhum"):
+        return []
+    # Marcador da legenda ("Bem vinculado a OUTRO item planejado") não é
+    # parte da descrição da aquisição em si.
+    text = re.sub(r"⚠\s*Vinc\.\s*outro item\s*", " ", text)
+
+    entries = []
+    pos = 0
+    for m in _QTD_TOTAL_RE.finditer(text):
+        desc = _clean(text[pos:m.start()])
+        # tira o rótulo de ano (ex.: "2025 ") do início da 1ª descrição
+        desc = re.sub(r"^20\d{2}\s+", "", desc)
+        # valores não devem ter espaço interno (artefato de quebra de
+        # linha no meio do número, ex.: "R$99.840,0 0" → "R$99.840,00")
+        total = re.sub(r"\s+", "", m.group(2))
+        qtd = re.sub(r"\s+", "", m.group(1))
+        entries.append({"descricao": desc, "qtd": qtd, "total": total})
+        pos = m.end()
+    return entries
+
+
+def _format_aquisicao_entries(item):
+    """Formata as aquisições vinculadas a este item planejado, uma por
+    bloco de 3 linhas (nome do item adquirido / Qtd: N / Total: R$X),
+    lidas da própria coluna 'Itens Adquiridos' do RGA — não do nome do
+    item planejado. Se não der pra reconhecer nenhuma aquisição no
+    texto, cai de volta numa linha-resumo (ver `_format_bem_line_fallback`)
+    pra não perder o item da lista."""
+    entries = _parse_itens_adquiridos(item.get("itens_adquiridos", ""))
+    if not entries:
+        return [_format_bem_line_fallback(item)]
+    blocos = []
+    for e in entries:
+        desc = e["descricao"] or item.get("descricao", "")
+        blocos.append(f"{desc}\nQtd: {e['qtd']}\nTotal: {e['total']}")
+    return blocos
 
 
 def _find_report_year(pdf):
@@ -1071,7 +1134,10 @@ def _extract_bens_por_meta(pdf):
                 or _to_float(it["vol_executado"]) > 0
                 or _to_float(it["vl_empenhado"]) > 0
             ]
-        bens_por_meta[num] = [_format_bem_line(it) for it in adquiridos]
+        blocos = []
+        for it in adquiridos:
+            blocos.extend(_format_aquisicao_entries(it))
+        bens_por_meta[num] = blocos
     return bens_por_meta
 
 
