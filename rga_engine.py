@@ -439,13 +439,36 @@ def _merge_row_range(ws, row, first_col, last_col, value):
     ws.cell(row=row, column=first_col).value = value
 
 
-def _value_below(words, label_idx, dx=(-15, 60), dy=(4, 25)):
+def _value_below(words, label_idx, dx=(-15, 60), dy=(4, 25), span=1):
     """A partir da posição de um rótulo (índice em `words`), acha o token
     mais próximo posicionado logo abaixo dele (mesma coluna) — é assim que
-    os campos de valor aparecem no PDF, um pouco abaixo do rótulo."""
+    os campos de valor aparecem no PDF, um pouco abaixo do rótulo.
+
+    `span` é quantos tokens (a partir de `label_idx`) fazem parte do
+    próprio rótulo, usado como ponto de partida para achar a última linha
+    do rótulo. Alguns rótulos são longos o bastante para quebrar em duas
+    linhas (ex.: "...Exercício financeiro em" / "análise):"), e a
+    continuação quebrada aparece alinhada à mesma margem esquerda do
+    rótulo (mesmo x0), só que numa linha um pouco abaixo — por isso,
+    depois do `span`, procuramos também por tokens alinhados a essa
+    margem logo abaixo da última linha já conhecida e estendemos `lt`
+    até eles, para não confundir a continuação do rótulo com o valor
+    real (que vem depois, e não está alinhado a essa margem)."""
     if label_idx is None:
         return ""
-    lx, lt = words[label_idx]["x0"], words[label_idx]["top"]
+    lx = words[label_idx]["x0"]
+    lt = max(w["top"] for w in words[label_idx:label_idx + span])
+    while True:
+        wrapped = [
+            w for w in words
+            if lt < w["top"] <= lt + 15 and abs(w["x0"] - lx) <= 3
+        ]
+        if not wrapped:
+            break
+        new_lt = max(w["top"] for w in wrapped)
+        if new_lt <= lt:
+            break
+        lt = new_lt
     best = None
     for w in words:
         if not (lt + dy[0] <= w["top"] <= lt + dy[1]):
@@ -547,34 +570,50 @@ def _extract_meta_especifica_avaliacao(pdf, num, page_idx, title_top, next_top_p
         min_top=title_top,
     )
 
-    # ─ Indicador / Fonte (crop em duas colunas) ─
+    # ─ Indicador / Fonte (rótulos + crop de coluna) ─
+    # A posição das colunas "Indicador da Meta Específica"/"Fonte dos
+    # Dados" varia de relatório para relatório (não existe uma margem fixa
+    # confiável — confirmado comparando o RGA AP|EVM|2023, onde essa
+    # coluna começa perto de x=50, com o RGA AC|RMVI|2023, onde começa
+    # perto de x=193). A âncora confiável é a posição real do PRÓPRIO
+    # rótulo nesta página, então o crop usa ind_word[0]/fonte_word[0]
+    # diretamente em vez de uma margem derivada do título ou fixa.
     ind_word = _word_top(page, "Indicador", contains=False, min_top=title_top)
     fonte_word = _word_top(page, "Fonte", contains=False, min_top=title_top)
     resultado_word = _word_top(page, "resultado", contains=False, min_top=title_top)
+
+    # Borda inferior do crop de Indicador/Fonte: quando a meta TEM
+    # indicador mensurável, logo abaixo vem a linha "Meta Específica/Ação
+    # Pactuada... / Valor de Referência (Apresentado...)"; quando NÃO tem,
+    # o PDF pula direto para "O resultado alcançado foi:". Sem esse limite
+    # dinâmico, o crop antigo (que ia direto até "resultado") engolia as
+    # linhas de valores junto com o Indicador/Fonte quando elas existiam —
+    # esse era o bug visto no RGA AC|RMVI|2023.
+    pactuada_idx = _seq_pos(words, ["Meta", "Específica/Ação", "Pactuada"], min_top=title_top)
+    pactuada_top = words[pactuada_idx]["top"] if pactuada_idx is not None else None
+
     indicador = fonte = ""
-    if ind_word and resultado_word:
+    if ind_word and fonte_word:
+        candidatos = [b for b in (pactuada_top, resultado_word[1] if resultado_word else None) if b]
+        bottom0 = (min(candidatos) - 1) if candidatos else (ind_word[1] + 90)
         top0 = ind_word[1] + 9
-        bottom0 = resultado_word[1] - 1
-        # A coluna "Fonte" nunca começa antes de ~x=300 no template deste
-        # relatório; um valor menor indica que a âncora "Fonte" encontrada
-        # não é a correta (ex.: outra ocorrência da palavra na página), e
-        # nesse caso é mais seguro cair no valor padrão do que produzir um
-        # corte que apaga o conteúdo do Indicador.
-        fonte_x0 = fonte_word[0] - 3 if (fonte_word and fonte_word[0] > 300) else 375
-        # Margem esquerda: mesma usada para a descrição (`left`, derivada da
-        # posição real do título nesta página) em vez de um valor fixo — um
-        # valor fixo (184) cortava o início do texto quando o conteúdo desta
-        # coluna começa mais à esquerda (visto em relatórios com a caixa
-        # "Meta Específica não possui indicador mensurável" marcada).
-        indicador = _clean(_crop_text(page, (left, top0, fonte_x0, bottom0)))
-        fonte     = _clean(_crop_text(page, (fonte_x0, top0, 571, bottom0)))
-        if not indicador and not fonte:
-            # Nenhuma das duas colunas rendeu texto: provavelmente top0/
-            # bottom0 não bateram com a linha certa. Tenta de novo com uma
-            # janela vertical mais generosa a partir do próprio rótulo.
-            bottom0 = ind_word[1] + 90
-            indicador = _clean(_crop_text(page, (left, top0, fonte_x0, bottom0)))
-            fonte     = _clean(_crop_text(page, (fonte_x0, top0, 571, bottom0)))
+        indicador = _clean(_crop_text(page, (ind_word[0] - 5, top0, fonte_word[0] - 15, bottom0)))
+        fonte     = _clean(_crop_text(page, (fonte_word[0] - 5, top0, page.width - 20, bottom0)))
+
+    # ─ Valores de referência (só existem no PDF quando a meta TEM
+    #   indicador mensurável — quando o checkbox está marcado, o RGA
+    #   substitui esse bloco pelo campo de texto livre de justificativa,
+    #   ver `justificativa` mais abaixo) ─
+    val_ref_plano = val_ref_monitorado = val_alcance = ""
+    if pactuada_idx is not None:
+        idx = _seq_pos(words, ["Valor", "de", "Referência", "(Apresentado"], min_top=title_top)
+        val_ref_plano = _value_below(words, idx)
+
+        idx = _seq_pos(words, ["Valor", "de", "Referência", "(Monitorado"], min_top=title_top)
+        val_ref_monitorado = _value_below(words, idx, dy=(4, 30), span=8)
+
+        idx = _seq_pos(words, ["Valor/Alcance", "da", "Meta", "Específica/Ação"], min_top=title_top)
+        val_alcance = _value_below(words, idx)
 
     # ─ Resultado alcançado (opção assinalada) ─
     resultado = ""
@@ -608,12 +647,12 @@ def _extract_meta_especifica_avaliacao(pdf, num, page_idx, title_top, next_top_p
         )
 
     # TODO: "A aquisição/contratação foi prevista em Plano de Aplicação?" e
-    # "Há vedação expressa do item adquirido?" são campos novos do template
-    # (set/2026) que ainda não têm extração implementada — o RGA de
-    # referência usado até agora não os traz no formulário. Assim que
-    # houver um PDF de exemplo com esses campos, localizar o(s) rótulo(s) e
-    # preencher aqui (podem ser por Meta Específica, ou por item da tabela
-    # 6.1 "Detalhamento dos Itens" — precisa confirmar no PDF real).
+    # "Há vedação expressa do item adquirido?" não são campos que existem
+    # no formulário do RGA — segundo a orientação da Mariana, devem ser
+    # calculados comparando os itens de "6.1. Detalhamento dos Itens por
+    # Meta Específica" com o que foi planejado. Ainda em aberto como
+    # agregar esse resultado (por item) numa única célula por Meta
+    # Específica — ver pergunta feita no chat antes de implementar.
     aquisicao_prevista = ""
     vedacao_expressa = ""
 
@@ -624,9 +663,9 @@ def _extract_meta_especifica_avaliacao(pdf, num, page_idx, title_top, next_top_p
         "fonte":              fonte,
         "aquisicao_prevista": aquisicao_prevista,
         "vedacao_expressa":   vedacao_expressa,
-        "val_ref_plano":      "",
-        "val_ref_monitorado": "",
-        "val_alcance":        "",
+        "val_ref_plano":      val_ref_plano,
+        "val_ref_monitorado": val_ref_monitorado,
+        "val_alcance":        val_alcance,
         "resultado":          resultado,
         "sem_indicador":      sem_indicador,
         "justificativa":      justificativa,
@@ -997,17 +1036,21 @@ def _copy_merged_ranges(ws_src, r_src, ws_dst, r_dst):
                 pass
 
 
-# Colunas de valor/resultado da Meta Geral que, quando "Plano não possui
-# Meta Geral mensurável" está marcado, são mescladas numa única célula com
-# o texto de justificativa (ver _write_meta_geral). Corresponde às colunas
-# F, G, H e I do template atual (Valor Ref. Apresentado/Monitorado,
-# Valor/Alcance e Resultado Alcançado) — colunas contíguas, sem espaçador.
-_MG_MERGE_KEYS = ("val_ref_plano", "val_ref_monitorado",
+# Colunas da Meta Geral que, quando "Plano não possui Meta Geral
+# mensurável" está marcado, são mescladas numa única célula com o texto
+# de justificativa (ver _write_meta_geral). Corresponde às colunas B a I
+# do template atual (Polaridade, Indicador, Fonte, Sinesp, Valor Ref.
+# Apresentado/Monitorado, Valor/Alcance e Resultado Alcançado) — conforme
+# orientação da Mariana: "AS COLUNAS B3 ATÉ I3 DEVEM SER MESCLADAS".
+_MG_MERGE_KEYS = ("polaridade", "indicador", "fonte", "sinesp",
+                   "val_ref_plano", "val_ref_monitorado",
                    "val_alcance", "resultado")
 
-# Colunas equivalentes na tabela de Meta Específica (H a K — contíguas).
-_ME_MERGE_KEYS = ("val_ref_plano", "val_ref_monitorado",
-                   "val_alcance", "resultado")
+# Colunas equivalentes na tabela de Meta Específica (C a K), conforme
+# orientação da Mariana: "AS COLUNAS 7C ATÉ 7K DEVEM SER MESCLADAS".
+_ME_MERGE_KEYS = ("aquisicao_prevista", "vedacao_expressa", "polaridade",
+                   "indicador", "fonte", "val_ref_plano",
+                   "val_ref_monitorado", "val_alcance", "resultado")
 
 
 def _write_meta_geral(ws, mg, tmpl_ws):
@@ -1028,7 +1071,7 @@ def _write_meta_geral(ws, mg, tmpl_ws):
 
     if sem_mensuravel:
         texto = _combine_justificativa(mg.get("demonstre"), mg.get("observacoes"))
-        _merge_row_range(ws, MG_DATA_ROW, MG_COLS["val_ref_plano"],
+        _merge_row_range(ws, MG_DATA_ROW, MG_COLS["polaridade"],
                           MG_COLS["resultado"], texto)
 
 
@@ -1051,7 +1094,7 @@ def _write_meta_especifica(ws, meta, block_idx, tmpl_ws):
 
     if sem_indicador:
         texto = _combine_justificativa(meta.get("justificativa"), meta.get("observacoes"))
-        _merge_row_range(ws, dr, ME_COLS["val_ref_plano"],
+        _merge_row_range(ws, dr, ME_COLS["aquisicao_prevista"],
                           ME_COLS["resultado"], texto)
 
 
@@ -1089,22 +1132,23 @@ def get_missing_cells(meta_geral: dict, metas: list) -> list:
             missing.append(label)
 
     chk("Meta Geral › Descrição",          meta_geral.get("descricao"))
-    chk("Meta Geral › Polaridade",         meta_geral.get("polaridade"))
-    # Indicador/Fonte da Meta Geral: campos novos do template, extração
-    # ainda não implementada (ver TODO em _extract_meta_geral) — ficam
-    # sempre "" por ora, e por isso sempre aparecem aqui até serem
-    # implementados. Isso é esperado, não um bug.
-    chk("Meta Geral › Indicador",          meta_geral.get("indicador"))
-    chk("Meta Geral › Fonte",              meta_geral.get("fonte"))
-    chk("Meta Geral › Sinesp",             meta_geral.get("sinesp"))
     if meta_geral.get("sem_meta_mensuravel"):
-        # Os campos de valor foram mesclados com o texto de justificativa
+        # As colunas B a I (Polaridade, Indicador, Fonte, Sinesp, valores
+        # e Resultado) foram mescladas com o texto de justificativa
         # ("Demonstre se o objetivo está sendo alcançado" + "Observações
         # complementares") — checar esse texto em vez de cada campo
         # individual, que fica em branco propositalmente nesse caso.
         chk("Meta Geral › Demonstre objetivo alcançado",
             _combine_justificativa(meta_geral.get("demonstre"), meta_geral.get("observacoes")))
     else:
+        chk("Meta Geral › Polaridade",         meta_geral.get("polaridade"))
+        # Indicador/Fonte da Meta Geral: campos novos do template, extração
+        # ainda não implementada (ver TODO em _extract_meta_geral) — ficam
+        # sempre "" por ora, e por isso sempre aparecem aqui até serem
+        # implementados. Isso é esperado, não um bug.
+        chk("Meta Geral › Indicador",          meta_geral.get("indicador"))
+        chk("Meta Geral › Fonte",              meta_geral.get("fonte"))
+        chk("Meta Geral › Sinesp",             meta_geral.get("sinesp"))
         chk("Meta Geral › Valor Ref. Plano",   meta_geral.get("val_ref_plano"))
         chk("Meta Geral › Valor Ref. Mon.",    meta_geral.get("val_ref_monitorado"))
         chk("Meta Geral › Valor/Alcance",      meta_geral.get("val_alcance"))
@@ -1112,17 +1156,20 @@ def get_missing_cells(meta_geral: dict, metas: list) -> list:
 
     for m in metas:
         n = m.get("numero", "?")
-        chk(f"Meta {n} › Indicador",       m.get("indicador"))
-        chk(f"Meta {n} › Fonte",           m.get("fonte"))
-        # Aquisição prevista/Vedação expressa: campos novos do template,
-        # extração ainda não implementada (ver TODO em
-        # _extract_meta_especifica_avaliacao) — mesmo caso do Indicador/
-        # Fonte da Meta Geral acima.
-        chk(f"Meta {n} › Aquisição Prevista", m.get("aquisicao_prevista"))
-        chk(f"Meta {n} › Vedação Expressa",   m.get("vedacao_expressa"))
         if m.get("sem_indicador"):
+            # As colunas C a K (Aquisição Prevista, Vedação Expressa,
+            # Polaridade, Indicador, Fonte, valores e Resultado) foram
+            # mescladas com o texto de justificativa — checar esse texto
+            # em vez de cada campo individual.
             chk(f"Meta {n} › Demonstre objetivo alcançado", m.get("justificativa"))
         else:
+            chk(f"Meta {n} › Indicador",       m.get("indicador"))
+            chk(f"Meta {n} › Fonte",           m.get("fonte"))
+            # Aquisição prevista/Vedação expressa: campos novos do
+            # template, extração ainda não implementada (ver TODO em
+            # _extract_meta_especifica_avaliacao).
+            chk(f"Meta {n} › Aquisição Prevista", m.get("aquisicao_prevista"))
+            chk(f"Meta {n} › Vedação Expressa",   m.get("vedacao_expressa"))
             chk(f"Meta {n} › Val. Ref. Mon.",  m.get("val_ref_monitorado"))
             chk(f"Meta {n} › Valor/Alcance",   m.get("val_alcance"))
             chk(f"Meta {n} › Resultado",       m.get("resultado"))
