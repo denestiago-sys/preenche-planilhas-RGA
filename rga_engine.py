@@ -716,19 +716,74 @@ _ITEM_COL_NAMES = [
 _ITEM_COL_DEFAULTS = [184, 292, 327, 366, 405, 443, 467, 497, 525, 584]
 
 
-def _detect_item_columns(page):
-    """Tenta calibrar os limites de coluna da tabela de itens a partir do
-    cabeçalho 'Item / Bem/Serviço ND ... Status ...' desta página; se não
-    encontrar, usa os valores padrão do template."""
-    words = {w["text"]: w["x0"] for w in page.extract_words()
-             if w["top"] < 700}
-    header_hits = [k for k in ("Item", "ND", "Status") if k in words]
-    if len(header_hits) < 2:
+def _detect_item_columns(pdf, first_pi, first_top):
+    """Calibra os limites de coluna da tabela 'Item / Bem/Serviço' a partir
+    da primeira linha de item real (linha começando com "1.") da primeira
+    Meta Específica do relatório.
+
+    A posição dessas colunas NÃO é estável entre RGAs diferentes — mesmo
+    dois relatórios da mesma Secretaria/Fundo podem ter larguras de coluna
+    bem diferentes (confirmado comparando duas versões reais do RGA
+    AC|RMVI|2023: a tabela de itens de uma delas começa em x≈74, a da
+    outra em x≈189). Por isso não há mais uma posição fixa de template —
+    a calibração usa a própria primeira linha de dados como referência:
+
+    1. Acha a palavra "ND" no cabeçalho da tabela (rótulo limpo, sem
+       quebra) para saber onde termina a coluna de descrição do item.
+    2. Acha a linha do item "1." e agrupa as palavras dessa linha (mais a
+       linha logo abaixo, já que valores como "R$2.503.740,00" e o nome
+       do órgão costumam quebrar em duas linhas) que ficam à direita da
+       coluna ND — cada uma dessas colunas (ND, 3 valores monetários, %
+       Exec, Status, Ano Exec., Itens Adquiridos) aparece como um único
+       token curto por linha, então agrupar por proximidade horizontal
+       (>15pt de distância = nova coluna) separa as 8 colunas corretamente
+       sem ser afetado pela descrição do item (que fica à esquerda de ND
+       e é ignorada aqui).
+
+    Se não for possível calibrar (relatório sem essa seção, ou formato
+    inesperado), cai de volta nos valores padrão do template antigo."""
+    page = pdf.pages[first_pi]
+    words = page.extract_words()
+
+    nd_x0 = None
+    for w in words:
+        if w["text"] == "ND" and first_top - 5 <= w["top"] <= first_top + 60:
+            nd_x0 = w["x0"]
+            break
+
+    item_top = None
+    item_x0 = None
+    limit_x0 = nd_x0 if nd_x0 is not None else 250
+    for w in words:
+        if w["top"] > first_top + 5 and re.fullmatch(r"1\.", w["text"]) and w["x0"] < limit_x0:
+            item_top = w["top"]
+            item_x0 = w["x0"]
+            break
+
+    if item_top is None or nd_x0 is None:
         return _ITEM_COL_DEFAULTS
-    # Sem uma calibração completa e confiável, mantém o padrão do template
-    # (validado empiricamente) — a detecção acima serve só para confirmar
-    # que estamos de fato numa página de tabela de itens.
-    return _ITEM_COL_DEFAULTS
+
+    band = [
+        w for w in words
+        if item_top - 1 <= w["top"] <= item_top + 35 and w["x0"] >= nd_x0 - 20
+    ]
+    xs = sorted(set(round(w["x0"]) for w in band))
+    clusters = []
+    for x in xs:
+        if not clusters or x - clusters[-1] > 15:
+            clusters.append(x)
+
+    # Precisamos de 8 colunas depois de "item" (nd, 3 valores, % exec,
+    # status, ano exec, itens adquiridos); sem elas todas, não dá pra
+    # confiar na calibração — melhor usar o padrão do template.
+    if len(clusters) < 8:
+        return _ITEM_COL_DEFAULTS
+
+    margin = 4
+    cols = [item_x0 - margin, nd_x0 - margin]
+    cols += [c - margin for c in clusters[1:8]]
+    cols.append(page.width)
+    return cols
 
 
 def _header_row_bottom(page):
@@ -780,11 +835,15 @@ def _normalize_status(s):
     return s
 
 
-def _extract_items_for_range(pdf, start_page, start_top, end_page, end_top):
+def _extract_items_for_range(pdf, start_page, start_top, end_page, end_top, cols=None):
     """Extrai todos os itens (linhas) da tabela 'Item / Bem/Serviço' entre
     (start_page, start_top) e (end_page, end_top), usando crops de coluna
-    por posição para não misturar o conteúdo de colunas vizinhas."""
-    cols = _ITEM_COL_DEFAULTS
+    por posição para não misturar o conteúdo de colunas vizinhas.
+
+    `cols` são os limites de coluna já calibrados para este relatório (ver
+    `_detect_item_columns`); se omitido, usa os valores padrão do
+    template."""
+    cols = cols if cols is not None else _ITEM_COL_DEFAULTS
     col_ranges = list(zip(cols[:-1], cols[1:]))
     names = _ITEM_COL_NAMES
 
@@ -804,7 +863,15 @@ def _extract_items_for_range(pdf, start_page, start_top, end_page, end_top):
             line_text = " ".join(toks)
             m = re.match(r"^(\d+)\.\s", line_text)
             if m:
-                item_starts.append((pi, top, m.group(1)))
+                # -0.5pt de folga: `top` é arredondado (round(w["top"], 1))
+                # pra agrupar palavras na mesma linha, mas o crop de coluna
+                # (passo 2, mais abaixo) usa esse valor como topo exato da
+                # banda — se o arredondamento subir o valor um tico acima
+                # do top real da palavra (ex.: 199.598 → 199.6), o
+                # within_bbox exclui a própria primeira linha do item
+                # (número + primeira palavra da descrição) da banda. A
+                # folga evita esse corte.
+                item_starts.append((pi, top - 0.5, m.group(1)))
 
     if not item_starts:
         return []
@@ -888,17 +955,25 @@ def _extract_items_for_range(pdf, start_page, start_top, end_page, end_top):
         ano_m = re.search(r"20\d{2}", ano_raw)
         ano = ano_m.group(0) if ano_m else ""
 
+        # Coluna "Itens Adquiridos": texto livre (pode ter várias linhas —
+        # ano(s) em que o item foi de fato adquirido, seguido de detalhes
+        # da aquisição, ou apenas "Nenhum" quando nada foi vinculado a este
+        # item planejado). Mantém como texto corrido (não "_joined_clean",
+        # que colaria as palavras sem espaço).
+        itens_adquiridos = _clean(" ".join(col_texts["itens_adquiridos"]))
+
         items.append({
-            "numero":        num,
-            "descricao":     item_desc,
-            "orgao":         orgao,
-            "nd":            nd,
-            "val_planejado": val_planejado,
-            "vl_empenhado":  vl_empenhado,
-            "vol_executado": vol_executado,
-            "pct_exec":      pct_val,
-            "status":        status,
-            "ano_exec":      ano,
+            "numero":            num,
+            "descricao":         item_desc,
+            "orgao":             orgao,
+            "nd":                nd,
+            "val_planejado":     val_planejado,
+            "vl_empenhado":      vl_empenhado,
+            "vol_executado":     vol_executado,
+            "pct_exec":          pct_val,
+            "status":            status,
+            "ano_exec":          ano,
+            "itens_adquiridos":  itens_adquiridos,
         })
     return items
 
@@ -923,10 +998,29 @@ def _format_bem_line(item):
     return " ".join(partes)
 
 
+def _find_report_year(pdf):
+    """Acha o ano do exercício financeiro do relatório, no cabeçalho da
+    primeira página ('RELATÓRIO DE GESTÃO — EXERCÍCIO FINANCEIRO 2025').
+    É esse ano — o da prestação de contas — que decide quais itens da
+    coluna "Itens Adquiridos" (em 6.1) contam como efetivamente
+    adquiridos nesse RGA."""
+    if not pdf.pages:
+        return ""
+    text = pdf.pages[0].extract_text() or ""
+    m = re.search(r"EXERC[ÍI]CIO\s+FINANCEIRO\s+(20\d{2})", text, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
 def _extract_bens_por_meta(pdf):
     """Localiza a seção '6.1. Detalhamento dos Itens por Meta Específica' e
     extrai, para cada Meta Específica, a lista de itens efetivamente
-    adquiridos (Vol. Executado > 0 ou Vl. Empenhado > 0)."""
+    adquiridos NO ANO DA PRESTAÇÃO DE CONTAS (o "Exercício Financeiro" do
+    cabeçalho do RGA) — conforme a própria coluna "Itens Adquiridos" da
+    tabela, que traz o ano da aquisição (ou "Nenhum" quando o item
+    planejado não teve nenhum bem/serviço vinculado a ele). Antes disso,
+    calibra as colunas da tabela a partir da primeira linha de item da
+    primeira Meta Específica (ver `_detect_item_columns`), já que a
+    posição das colunas varia entre relatórios."""
     idx_page = None
     for pi, page in enumerate(pdf.pages):
         text = page.extract_text() or ""
@@ -937,19 +1031,46 @@ def _extract_bens_por_meta(pdf):
         return {}
 
     starts, end = _find_meta_especifica_table_starts(pdf, idx_page)
+    if not starts:
+        return {}
+
+    ano_exercicio = _find_report_year(pdf)
+    first_num, first_pi, first_top = starts[0]
+    cols = _detect_item_columns(pdf, first_pi, first_top)
+
     bens_por_meta = {}
     for i, (num, pi, top) in enumerate(starts):
         if i + 1 < len(starts):
             npi, ntop = starts[i + 1][1], starts[i + 1][2]
         else:
             npi, ntop = end
-        items = _extract_items_for_range(pdf, pi, top, npi, ntop)
-        adquiridos = [
-            it for it in items
-            if (it["pct_exec"] or 0) > 0
-            or _to_float(it["vol_executado"]) > 0
-            or _to_float(it["vl_empenhado"]) > 0
-        ]
+        items = _extract_items_for_range(pdf, pi, top, npi, ntop, cols=cols)
+        if ano_exercicio:
+            # Fonte da verdade: a própria coluna "Itens Adquiridos" traz o
+            # ano em que o item foi adquirido (ou "Nenhum"). Só entram os
+            # itens cujo ano bate com o exercício financeiro deste RGA.
+            # Um item começando com "Nenhum" nunca conta como adquirido —
+            # mesmo que o crop tenha vazado texto do item seguinte pra
+            # dentro da mesma célula (linhas próximas na tabela), o que
+            # faria o ano aparecer como substring mesmo sem pertencer a
+            # este item.
+            def _foi_adquirido(it):
+                txt = (it.get("itens_adquiridos") or "").strip()
+                if txt.startswith("Nenhum"):
+                    return False
+                return ano_exercicio in txt
+
+            adquiridos = [it for it in items if _foi_adquirido(it)]
+        else:
+            # Não foi possível achar o ano do exercício no cabeçalho —
+            # volta pro critério antigo (valor executado/empenhado > 0)
+            # como salvaguarda, em vez de não trazer nada.
+            adquiridos = [
+                it for it in items
+                if (it["pct_exec"] or 0) > 0
+                or _to_float(it["vol_executado"]) > 0
+                or _to_float(it["vl_empenhado"]) > 0
+            ]
         bens_por_meta[num] = [_format_bem_line(it) for it in adquiridos]
     return bens_por_meta
 
