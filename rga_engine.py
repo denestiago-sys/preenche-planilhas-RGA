@@ -286,7 +286,12 @@ def _extract_meta_geral(pdf):
 
     demonstre = _extract_paragraph_after(
         t2, r"Demonstre se o objetivo está sendo alcançado \(obrigatório\)",
-        [r"\n\s*1\.4\."],
+        # A ordem das seções na página varia entre relatórios — às vezes
+        # "1.4." (as opções de alcance) vem ANTES de "Demonstre..." (não
+        # depois), o que faria esse limite nunca aparecer no texto restante
+        # e o parágrafo vazar pra dentro de "1.5." inteira. Por isso
+        # delimita também por "1.5.", que sempre vem depois.
+        [r"\n\s*1\.4\.", r"\n\s*1\.5\."],
     )
     observacoes = _extract_paragraph_after(
         t2, r"1\.5\. Observações complementares \(opcional\)",
@@ -402,15 +407,33 @@ def _alcance_option_rows(page, top_bound, bottom_bound):
     return list(zip(_ALCANCE_OPCOES, tops))
 
 
+def _word_matches(actual, expected):
+    """Compara uma palavra extraída do PDF com o token esperado, tolerando
+    truncamento: alguns rótulos (checkboxes, cabeçalhos de seção) são
+    cortados no meio da última palavra quando o container é estreito
+    demais pro texto (ex.: "mensurável" vira "mensuráv" no PDF de
+    origem, mesmo aparecendo por completo na tela do sistema) — mesma
+    causa-raiz já vista na coluna "Itens Adquiridos". Aceita igualdade
+    exata ou um dos dois ser prefixo do outro (com pelo menos 4
+    caracteres, pra não bater com qualquer abreviação por acaso)."""
+    if actual == expected:
+        return True
+    if len(actual) >= 4 and len(expected) >= 4:
+        return actual.startswith(expected) or expected.startswith(actual)
+    return False
+
+
 def _seq_pos(words, seq, min_top=0):
-    """Retorna o índice em `words` onde começa a sequência exata de tokens
-    `seq` (ex.: ["Meta","Geral","Pactuada"]), a partir de min_top. Usado
-    para localizar rótulos sem depender de regex sobre texto corrido."""
+    """Retorna o índice em `words` onde começa a sequência de tokens `seq`
+    (ex.: ["Meta","Geral","Pactuada"]), a partir de min_top — comparando
+    com `_word_matches` (tolera a última palavra vir truncada no PDF).
+    Usado para localizar rótulos sem depender de regex sobre texto
+    corrido."""
     n = len(seq)
     for i in range(len(words) - n + 1):
         if words[i]["top"] < min_top:
             continue
-        if all(words[i + j]["text"] == seq[j] for j in range(n)):
+        if all(_word_matches(words[i + j]["text"], seq[j]) for j in range(n)):
             return i
     return None
 
