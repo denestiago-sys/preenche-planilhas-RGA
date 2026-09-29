@@ -187,7 +187,16 @@ def _extract_visao_geral_financeira(page0):
     de palavras e pegando o valor 'R$...' logo abaixo dele — evita depender
     de coordenadas fixas ou da ordem em que o texto corrido aparece."""
     total_disp = _find_value_below_label(page0, ["TOTAL", "DISPONIBILIZADO"]) or ""
-    exec_val = _find_value_below_label(page0, ["EXEC.", "FINANCEIRO"]) or ""
+
+    # "EXEC. FINANCEIRO NO EXERCÍCIO" é o valor executado relativo apenas
+    # ao exercício financeiro em análise deste RGA — diferente de "EXEC.
+    # FINANCEIRO TOTAL" (acumulado desde o início do plano, pode incluir
+    # exercícios anteriores). A sequência de 4 palavras busca
+    # especificamente a coluna "NO EXERCÍCIO"; se o relatório não tiver
+    # essa coluna (formato mais antigo), cai para a busca genérica antiga.
+    exec_val = _find_value_below_label(
+        page0, ["EXEC.", "FINANCEIRO", "NO", "EXERCÍCIO"]
+    ) or _find_value_below_label(page0, ["EXEC.", "FINANCEIRO"]) or ""
 
     # Recurso final (bem menos confiável): texto corrido com layout.
     if not total_disp or not exec_val:
@@ -196,7 +205,9 @@ def _extract_visao_geral_financeira(page0):
             m = re.search(r"TOTAL DISPONIBILIZADO.*?(R\$[\d\.,]+)", t, re.DOTALL)
             total_disp = m.group(1) if m else ""
         if not exec_val:
-            m = re.search(r"EXEC\.?\s*FINANCEIRO TOTA\w*\s*\n?\s*(R\$[\d\.,]+)", t)
+            m = re.search(r"EXEC\.?\s*FINANCEIRO\s*NO\s*EXERC[ÍI]CIO\s*\n?\s*(R\$[\d\.,]+)", t)
+            if not m:
+                m = re.search(r"EXEC\.?\s*FINANCEIRO TOTA\w*\s*\n?\s*(R\$[\d\.,]+)", t)
             exec_val = m.group(1) if m else ""
 
     return total_disp, exec_val
@@ -358,10 +369,10 @@ def _extract_meta_geral(pdf):
 
     return {
         "descricao": (
-            f"META GERAL:  {descricao}"
-            f"    VALOR TOTAL DISPONIBILIZADO  {total_disp}"
-            f"    VALOR EXECUTADO FINANCEIRO TOTAL  {exec_val}"
-            f"    STATUS  EM EXECUÇÃO"
+            f"META GERAL:\n{descricao}\n\n"
+            f"VALOR TOTAL DISPONIBILIZADO (inclusive rendimentos):\n{total_disp}\n\n"
+            f"VALOR EXECUTADO NO EXERCÍCIO EM ANÁLISE:\n{exec_val}\n\n"
+            f"STATUS:\nEM EXECUÇÃO"
         ),
         "polaridade":         polaridade,
         "indicador":          indicador,
@@ -505,16 +516,28 @@ def _combine_justificativa(demonstre, observacoes):
     return "\n\n".join(partes)
 
 
+def _unmerge_overlapping(ws, row, first_col, last_col):
+    """Remove qualquer mesclagem já existente na linha `row` que se
+    sobreponha ao intervalo de colunas `first_col`..`last_col`. Usado tanto
+    antes de criar uma nova mesclagem (o openpyxl recusa mesclar por cima de
+    uma mesclagem já existente) quanto antes de escrever valores célula a
+    célula — o template pode trazer mesclagens residuais (ex.: uma faixa
+    tipo H7:K7 deixada de uma edição manual no Excel) que, se não forem
+    desfeitas, transformam as células não-âncora em `MergedCell`, cujo
+    `.value` é somente leitura e quebra a escrita direta."""
+    for rng in [r for r in list(ws.merged_cells.ranges)
+                if r.min_row <= row <= r.max_row
+                and not (r.max_col < first_col or r.min_col > last_col)]:
+        ws.unmerge_cells(str(rng))
+
+
 def _merge_row_range(ws, row, first_col, last_col, value):
     """Mescla as células de `first_col` a `last_col` na linha `row` e grava
     `value` na célula resultante. Remove antes qualquer mesclagem já
     existente que se sobreponha ao intervalo (ex.: as mesclagens H:I / J:K
     herdadas do template) — o openpyxl recusa criar uma mesclagem que
     sobreponha uma mesclagem já existente."""
-    for rng in [r for r in list(ws.merged_cells.ranges)
-                if r.min_row <= row <= r.max_row
-                and not (r.max_col < first_col or r.min_col > last_col)]:
-        ws.unmerge_cells(str(rng))
+    _unmerge_overlapping(ws, row, first_col, last_col)
     ws.merge_cells(start_row=row, start_column=first_col,
                     end_row=row, end_column=last_col)
     ws.cell(row=row, column=first_col).value = value
@@ -621,6 +644,23 @@ def _extract_meta_especifica_avaliacao(pdf, num, page_idx, title_top, next_top_p
 
     plan_word = _word_top(page, "Planejado:", contains=False, min_top=title_top)
     desc_bottom = plan_word[1] if plan_word else title_top + 60
+
+    # A caixa de valor ("Total Planejado" / "R$...") fica à direita, mas o
+    # rótulo "Total" é curto — sua posição x0 não basta pra excluir a caixa
+    # inteira quando o VALOR em si (ex.: "R$11.509.335,14") é mais largo e
+    # começa mais à esquerda que o rótulo. Sem esse ajuste, esse valor
+    # "vaza" pra dentro do crop da descrição (aparece colado no início do
+    # texto). Procura por qualquer token "R$..." na mesma faixa vertical do
+    # cabeçalho do card e usa a posição mais à esquerda encontrada, se for
+    # mais restritiva que a do rótulo "Total".
+    money_words = [
+        w for w in words
+        if title_top - 2 <= w["top"] < desc_bottom
+        and re.match(r"^R\$[\d\.,]+$", w["text"])
+    ]
+    if money_words:
+        right = min(right, min(w["x0"] for w in money_words) - 15)
+
     desc_txt = _crop_text(page, (left, title_top + 6, right, desc_bottom - 1))
     desc = _clean(desc_txt)
 
@@ -776,11 +816,13 @@ def _extract_metas_especificas(pdf, section2_end_page):
     uniq.sort(key=lambda x: int(x["numero"]))
 
     for m in uniq:
+        _plan = m.pop('_plan')
+        _exec = m.pop('_exec')
         m["descricao"] = (
-            f"META ESPECÍFICA {m['numero']}:  {m.pop('_desc')}"
-            f"    VALOR PLANEJADO  R$ {m.pop('_plan')}"
-            f"    VALOR EXECUTADO  R$ {m.pop('_exec')}"
-            f"    STATUS  EM EXECUÇÃO"
+            f"META ESPECÍFICA {m['numero']}:\n{m.pop('_desc')}\n\n"
+            f"VALOR PLANEJADO:\nR$ {_plan}\n\n"
+            f"VALOR EXECUTADO:\nR$ {_exec}\n\n"
+            f"STATUS:\nEM EXECUÇÃO"
         )
     return uniq
 
@@ -1393,6 +1435,12 @@ def _write_meta_geral(ws, mg, tmpl_ws):
     for r in [MG_TITLE_ROW, MG_HEADER_ROW, MG_DATA_ROW]:
         _copy_merged_ranges(tmpl_ws, r, ws, r)
 
+    # Desfaz qualquer mesclagem residual herdada do template nessa linha
+    # (ex.: uma faixa deixada de uma edição manual no Excel) antes de
+    # escrever célula a célula — senão as células que não são a âncora da
+    # mesclagem viram `MergedCell`, cujo `.value` é somente leitura.
+    _unmerge_overlapping(ws, MG_DATA_ROW, min(MG_COLS.values()), max(MG_COLS.values()))
+
     sem_mensuravel = mg.get("sem_meta_mensuravel")
     for key, col in MG_COLS.items():
         if sem_mensuravel and key in _MG_MERGE_KEYS:
@@ -1416,6 +1464,10 @@ def _write_meta_especifica(ws, meta, block_idx, tmpl_ws):
         _copy_merged_ranges(tmpl_ws, r_src, ws, r_dst)
 
     dr = base + 2
+    # Idem: desfaz mesclagens residuais herdadas do template na linha de
+    # dados antes de escrever célula a célula.
+    _unmerge_overlapping(ws, dr, min(ME_COLS.values()), max(ME_COLS.values()))
+
     sem_indicador = meta.get("sem_indicador")
     for key, col in ME_COLS.items():
         if sem_indicador and key in _ME_MERGE_KEYS:
