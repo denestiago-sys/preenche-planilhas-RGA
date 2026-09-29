@@ -929,7 +929,21 @@ def _find_meta_especifica_table_starts(pdf, start_page):
         page = pdf.pages[pi]
         text = page.extract_text() or ""
         if pi > start_page and re.search(r"6\.2\.|PENDÊNCIAS DAS CONTAS", text):
-            end = (pi - 1, pdf.pages[pi - 1].height)
+            # "6.2." pode estar na MESMA página em que a tabela de itens
+            # termina (ex.: últimos itens no topo, rodapé "6.2." logo
+            # abaixo) — excluir a página inteira nesse caso cortaria
+            # itens de aquisição válidos. Por isso usa o "top" exato de
+            # onde "6.2."/"PENDÊNCIAS" começa nessa página como limite,
+            # em vez de sempre voltar pra página anterior inteira.
+            top = None
+            for w in page.extract_words():
+                if w["text"].startswith("6.2.") or w["text"].startswith("PENDÊNCIAS"):
+                    top = w["top"]
+                    break
+            if top is not None:
+                end = (pi, top)
+            else:
+                end = (pi - 1, pdf.pages[pi - 1].height)
             break
         m = re.search(r"Meta Específica\s+(\d+)\s*[—-]", text)
         if m:
@@ -1281,6 +1295,16 @@ def _extract_bens_por_meta(pdf):
         if "Detalhamento dos Itens por Meta Específica" in text:
             idx_page = pi
             break
+    if idx_page is None:
+        # Alguns RGAs não imprimem o título da seção "6.1." como texto
+        # próprio (a tabela de itens aparece direto, sem esse cabeçalho) —
+        # nesse caso usa a própria tabela de itens ("Item / Bem/Serviço...
+        # Itens Adquiridos") como âncora alternativa.
+        for pi, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            if "Item / Bem/Serviço" in text and "Itens Adquiridos" in text:
+                idx_page = pi
+                break
     if idx_page is None:
         return {}
 
