@@ -159,9 +159,17 @@ def _crop_words(page, bbox):
 
 
 def _word_top(page, text, contains=False, min_top=0):
-    """Retorna (x0, top) da primeira ocorrência de uma palavra na página."""
+    """Retorna (x0, top) da primeira ocorrência de uma palavra na página.
+
+    `min_top` usa uma pequena tolerância (2pt) porque palavras que estão,
+    na prática, na mesma linha de referência (ex.: o rótulo "Total" ao
+    lado do título "META ESPECÍFICA N") podem ter um `top` poucos pontos
+    menor devido a diferenças de fonte/baseline — sem essa folga, uma
+    busca com min_top=title_top descartava erroneamente esse rótulo e
+    fazia o código cair num bbox padrão (fallback) estreito demais,
+    cortando a descrição no meio da frase."""
     for w in page.extract_words():
-        if w["top"] < min_top:
+        if w["top"] < min_top - 2:
             continue
         if (contains and text in w["text"]) or (not contains and w["text"] == text):
             return w["x0"], w["top"]
@@ -202,12 +210,12 @@ def _extract_visao_geral_financeira(page0):
     if not total_disp or not exec_val:
         t = page0.extract_text(layout=True) or ""
         if not total_disp:
-            m = re.search(r"TOTAL DISPONIBILIZADO.*?(R\$[\d\.,]+)", t, re.DOTALL)
+            m = re.search(r"TOTAL DISPONIBILIZADO.*?(R?\$[\d\.,]+)", t, re.DOTALL)
             total_disp = m.group(1) if m else ""
         if not exec_val:
-            m = re.search(r"EXEC\.?\s*FINANCEIRO\s*NO\s*EXERC[ÍI]CIO\s*\n?\s*(R\$[\d\.,]+)", t)
+            m = re.search(r"EXEC\.?\s*FINANCEIRO\s*NO\s*EXERC[ÍI]CIO\s*\n?\s*(R?\$[\d\.,]+)", t)
             if not m:
-                m = re.search(r"EXEC\.?\s*FINANCEIRO TOTA\w*\s*\n?\s*(R\$[\d\.,]+)", t)
+                m = re.search(r"EXEC\.?\s*FINANCEIRO TOTA\w*\s*\n?\s*(R?\$[\d\.,]+)", t)
             exec_val = m.group(1) if m else ""
 
     return total_disp, exec_val
@@ -622,7 +630,7 @@ def _value_below(words, label_idx, dx=(-15, 60), dy=(4, 25), span=1):
     return best["text"] if best else ""
 
 
-def _find_value_below_label(page, label_words, value_regex=r"^R\$[\d\.,]+$",
+def _find_value_below_label(page, label_words, value_regex=r"^R?\$[\d\.,]+$",
                              x_pad=(-10, 110), y_max=90, min_top=0):
     """Localiza a sequência de tokens `label_words` e devolve o primeiro
     token cujo texto bate com `value_regex`, posicionado abaixo do rótulo
@@ -694,7 +702,7 @@ def _extract_meta_especifica_avaliacao(pdf, num, page_idx, title_top, next_top_p
     money_words = [
         w for w in words
         if title_top - 2 <= w["top"] < desc_bottom
-        and re.match(r"^R\$[\d\.,]+$", w["text"])
+        and re.match(r"^R?\$[\d\.,]+$", w["text"])
     ]
     if money_words:
         right = min(right, min(w["x0"] for w in money_words) - 15)
