@@ -189,6 +189,23 @@ def extract_rga_signature(pages):
 # META GERAL (página 1 = visão geral financeira / página 2 = avaliação)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _normalize_money_symbol(value):
+    """Garante que um valor monetário extraído do PDF sempre exiba o
+    símbolo 'R$' na planilha final, mesmo quando o PDF de origem o
+    renderiza apenas como '$' (visto em alguns RGAs, ex. Maranhão, por
+    uma peculiaridade da fonte/geração do PDF — o valor em si está
+    correto, só falta o 'R'). Não altera o valor já formatado como
+    'R$...', nem mexe nos dígitos/formatação numérica."""
+    if not value:
+        return value
+    v = value.strip()
+    if v.startswith("R$"):
+        return v
+    if v.startswith("$"):
+        return "R" + v
+    return v
+
+
 def _extract_visao_geral_financeira(page0):
     """Lê os valores 'TOTAL DISPONIBILIZADO' e 'EXEC. FINANCEIRO TOTAL' do
     topo do relatório (página 1), localizando o rótulo pela sequência exata
@@ -218,7 +235,7 @@ def _extract_visao_geral_financeira(page0):
                 m = re.search(r"EXEC\.?\s*FINANCEIRO TOTA\w*\s*\n?\s*(R?\$[\d\.,]+)", t)
             exec_val = m.group(1) if m else ""
 
-    return total_disp, exec_val
+    return _normalize_money_symbol(total_disp), _normalize_money_symbol(exec_val)
 
 
 def _find_page_with_text(pdf, needle, start=0):
