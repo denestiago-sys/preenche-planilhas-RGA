@@ -461,17 +461,55 @@ def _word_matches(actual, expected):
     return False
 
 
-def _seq_pos(words, seq, min_top=0):
+def _seq_pos(words, seq, min_top=0, x_tol=6):
     """Retorna o índice em `words` onde começa a sequência de tokens `seq`
     (ex.: ["Meta","Geral","Pactuada"]), a partir de min_top — comparando
     com `_word_matches` (tolera a última palavra vir truncada no PDF).
     Usado para localizar rótulos sem depender de regex sobre texto
-    corrido."""
+    corrido.
+
+    Cada próximo token é aceito em dois casos: (a) mesma linha, à direita
+    do anterior (ordem de leitura normal); ou (b) linha seguinte, alinhado
+    à mesma margem esquerda do PRIMEIRO token da sequência (continuação de
+    um rótulo que quebrou em duas linhas). O caso (b) é necessário porque,
+    em páginas com vários cartões lado a lado (ex.: "TOTAL" / "DISPONIBILI-
+    ZADO" em linhas separadas), a continuação do rótulo NÃO fica adjacente
+    na lista de palavras — entre as duas linhas entram palavras de cartões
+    vizinhos que aparecem antes dela na ordem de leitura (top, depois x0).
+    Checar apenas adjacência estrita de índice (como antes) falha nesses
+    casos; buscar a continuação por alinhamento de coluna resolve isso."""
     n = len(seq)
-    for i in range(len(words) - n + 1):
+    for i in range(len(words)):
         if words[i]["top"] < min_top:
             continue
-        if all(_word_matches(words[i + j]["text"], seq[j]) for j in range(n)):
+        if not _word_matches(words[i]["text"], seq[0]):
+            continue
+        anchor_x0 = words[i]["x0"]
+        cur = words[i]
+        ok = True
+        for j in range(1, n):
+            same_line = sorted(
+                (w for w in words
+                 if abs(w["top"] - cur["top"]) < 2
+                 and 0 <= w["x0"] - cur["x1"] < 40),
+                key=lambda w: w["x0"],
+            )
+            nxt = same_line[0] if same_line and _word_matches(
+                same_line[0]["text"], seq[j]) else None
+            if nxt is None:
+                wrapped = sorted(
+                    (w for w in words
+                     if w["top"] > cur["top"]
+                     and abs(w["x0"] - anchor_x0) <= x_tol),
+                    key=lambda w: w["top"],
+                )
+                if wrapped and _word_matches(wrapped[0]["text"], seq[j]):
+                    nxt = wrapped[0]
+            if nxt is None:
+                ok = False
+                break
+            cur = nxt
+        if ok:
             return i
     return None
 
