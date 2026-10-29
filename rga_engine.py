@@ -928,22 +928,32 @@ def _detect_item_columns(pdf, first_pi, first_top):
 
     Se não for possível calibrar (relatório sem essa seção, ou formato
     inesperado), cai de volta nos valores padrão do template antigo."""
-    page = pdf.pages[first_pi]
-    words = page.extract_words()
-
-    nd_x0 = None
-    for w in words:
-        if w["text"] == "ND" and first_top - 5 <= w["top"] <= first_top + 60:
-            nd_x0 = w["x0"]
-            break
-
-    item_top = None
-    item_x0 = None
-    limit_x0 = nd_x0 if nd_x0 is not None else 250
-    for w in words:
-        if w["top"] > first_top + 5 and re.fullmatch(r"1\.", w["text"]) and w["x0"] < limit_x0:
-            item_top = w["top"]
-            item_x0 = w["x0"]
+    # O título "Meta Específica N —" pode ficar numa página e a tabela de
+    # itens (cabeçalho + linha "1.") só começar na seguinte — acontece
+    # quando o título cai no fim da página. Por isso procura a primeira
+    # página, a partir da do título (até 4 páginas), que tenha o cabeçalho
+    # "ND" e a linha do item "1.".
+    page = words = None
+    nd_x0 = item_top = item_x0 = None
+    for pj in range(first_pi, min(first_pi + 4, len(pdf.pages))):
+        pg = pdf.pages[pj]
+        ws = pg.extract_words()
+        top_min = first_top - 5 if pj == first_pi else 0
+        nd = None
+        for w in ws:
+            if w["text"] == "ND" and w["top"] >= top_min:
+                nd = w["x0"]
+                nd_top = w["top"]
+                break
+        if nd is None:
+            continue
+        for w in ws:
+            if (w["top"] > nd_top and re.fullmatch(r"1\.", w["text"])
+                    and w["x0"] < nd):
+                page, words = pg, ws
+                nd_x0, item_top, item_x0 = nd, w["top"], w["x0"]
+                break
+        if item_top is not None:
             break
 
     if item_top is None or nd_x0 is None:
@@ -991,34 +1001,37 @@ def _find_meta_especifica_table_starts(pdf, start_page):
     for pi in range(start_page, len(pdf.pages)):
         page = pdf.pages[pi]
         text = page.extract_text() or ""
-        if pi > start_page and re.search(r"6\.2\.|PENDÊNCIAS DAS CONTAS", text):
-            # "6.2." pode estar na MESMA página em que a tabela de itens
-            # termina (ex.: últimos itens no topo, rodapé "6.2." logo
-            # abaixo) — excluir a página inteira nesse caso cortaria
-            # itens de aquisição válidos. Por isso usa o "top" exato de
-            # onde "6.2."/"PENDÊNCIAS" começa nessa página como limite,
-            # em vez de sempre voltar pra página anterior inteira.
-            top = None
-            for w in page.extract_words():
+        words = page.extract_words()
+
+        # "6.2." pode estar na MESMA página em que a tabela de itens
+        # termina (ex.: últimos itens no topo, rodapé "6.2." logo
+        # abaixo) — excluir a página inteira nesse caso cortaria itens de
+        # aquisição válidos (e até uma Meta Específica inteira, se o
+        # título dela estiver acima do "6.2."). Por isso usa o "top" exato
+        # de onde "6.2."/"PENDÊNCIAS" começa nessa página como limite.
+        end_top = None
+        has_end = pi > start_page and re.search(r"6\.2\.|PENDÊNCIAS DAS CONTAS", text)
+        if has_end:
+            for w in words:
                 if w["text"].startswith("6.2.") or w["text"].startswith("PENDÊNCIAS"):
-                    top = w["top"]
+                    end_top = w["top"]
                     break
-            if top is not None:
-                end = (pi, top)
-            else:
-                end = (pi - 1, pdf.pages[pi - 1].height)
+
+        # Uma mesma página pode ter VÁRIOS títulos "Meta Específica N —"
+        # (metas com poucos itens ficam uma embaixo da outra) — por isso
+        # percorre todas as palavras da página, e não só a primeira
+        # ocorrência.
+        for i in range(len(words) - 3):
+            if (words[i]["text"] == "Meta" and words[i + 1]["text"] == "Específica"
+                    and re.fullmatch(r"\d+", words[i + 2]["text"])
+                    and words[i + 3]["text"] in ("—", "-", "–")):
+                if end_top is not None and words[i]["top"] >= end_top:
+                    continue
+                starts.append((words[i + 2]["text"], pi, words[i]["top"]))
+
+        if has_end:
+            end = (pi, end_top) if end_top is not None else (pi - 1, pdf.pages[pi - 1].height)
             break
-        m = re.search(r"Meta Específica\s+(\d+)\s*[—-]", text)
-        if m:
-            # localiza o "top" exato do início do título nesta página
-            top = None
-            words = page.extract_words()
-            for i, w in enumerate(words):
-                if (w["text"] == "Meta" and i + 1 < len(words)
-                        and words[i + 1]["text"] == "Específica"):
-                    top = w["top"]
-                    break
-            starts.append((m.group(1), pi, top if top is not None else 0))
     if end is None:
         end = (len(pdf.pages) - 1, pdf.pages[-1].height)
     return starts, end
@@ -1250,8 +1263,23 @@ def _format_bem_line_fallback(item):
 # no PDF, quebra em qualquer ponto). Ex.: "R$99.840,0 0" no lugar de
 # "R$99.840,00". Por isso o padrão aceita espaço opcional entre
 # QUALQUER dígito/separador do valor, não só um espaço fixo após "R$".
-_MONEY_RE = r"R\$\s?(?:[\d\.]\s?)+,\s?\d\s?\d"
+# Dois formatos de valor:
+#  (A) "R$1.234,56" — formato brasileiro, com "R$" e vírgula decimal,
+#      tolerando espaços soltos no meio dos dígitos (quebra de linha da
+#      célula estreita, ex.: "R$99.840,0 0");
+#  (B) "$1,234.56" — alguns RGAs (ex.: Maranhão) trazem o valor em formato
+#      americano e SEM o "R". Só aceito quando começa em "$" sem "R", para
+#      não "adivinhar" um número truncado do tipo "R$87.7 2" (valor cortado
+#      no PDF) — nesse caso é melhor descartar do que gravar um valor
+#      errado. O `(?!\d)` final impede parar no meio do número.
+_MONEY_RE = (r"(?:R\$\s?(?:[\d\.]\s?)+,\s?\d\s?\d"
+             r"|(?<![R\w])\$\s?(?:[\d,]\s?)*?\.\s?\d\s?\d(?!\d))")
 _QTD_TOTAL_RE = re.compile(rf"Qtd:\s*([\d\.,\s]+?)\s*Total:\s*({_MONEY_RE})")
+
+
+def SP(word):
+    """Regex de `word` tolerando espaços soltos entre as letras."""
+    return r"\s*".join(re.escape(c) for c in word) + r"\s*"
 
 
 def _parse_itens_adquiridos(raw):
@@ -1282,6 +1310,9 @@ def _parse_itens_adquiridos(raw):
     # Marcador da legenda ("Bem vinculado a OUTRO item planejado") não é
     # parte da descrição da aquisição em si.
     text = re.sub(r"⚠\s*Vinc\.\s*outro item\s*", " ", text)
+    # Selo "⚠ ND Divergente condicionado" (a célula estreita pode quebrar
+    # as palavras no meio: "condicion ado") — não faz parte da descrição.
+    text = re.sub(r"⚠\s*ND\s*"+SP("Divergente")+SP("condicionado"), " ", text)
 
     entries = []
     pos = 0
@@ -1294,8 +1325,11 @@ def _parse_itens_adquiridos(raw):
             desc = _clean(desc[ano_m.end():])
         # valores não devem ter espaço interno (artefato de quebra de
         # linha no meio do número, ex.: "R$99.840,0 0" → "R$99.840,00")
-        total = re.sub(r"\s+", "", m.group(2))
+        total = _normalize_money_symbol(re.sub(r"\s+", "", m.group(2)))
         qtd = re.sub(r"\s+", "", m.group(1))
+        # Valor monetário da coluna vizinha que vazou para o começo da
+        # descrição (ex.: "R$2.169,56 CADEIRA LONGARINA...") — não é do item.
+        desc = re.sub(r"^R?\$[\d.,]+\s+", "", desc)
         entries.append({"descricao": desc, "qtd": qtd, "total": total, "ano": ano_atual})
         pos = m.end()
     return entries
@@ -1315,7 +1349,15 @@ def _format_aquisicao_entries(item, ano_exercicio=None):
     partir de um item cujo texto não deu pra interpretar."""
     entries = _parse_itens_adquiridos(item.get("itens_adquiridos", ""))
     if ano_exercicio:
-        entries = [e for e in entries if e.get("ano") == ano_exercicio]
+        # Quando a célula não traz nenhum rótulo de ano (o RGA só imprime
+        # o ano dentro de "Itens Adquiridos" quando há mais de um), vale o
+        # ano da própria linha ("Ano Exec."); se a linha lista vários
+        # anos, o primeiro — as aquisições sem rótulo vêm antes do
+        # primeiro rótulo da célula.
+        _m_ano = re.search(r"20\d{2}", item.get("ano_exec", "") or "")
+        _ano_linha = _m_ano.group(0) if _m_ano else None
+        entries = [e for e in entries
+                   if (e.get("ano") or _ano_linha) == ano_exercicio]
         if not entries:
             return []
     elif not entries:
