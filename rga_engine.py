@@ -1424,6 +1424,36 @@ def _to_float(raw):
 
 # ─── Entry point de extração ───────────────────────────────────────────────
 
+# ─── Correção do caractere "¿" ─────────────────────────────────────────────
+# O sistema que gera o RGA grava alguns textos com perda de codificação: o
+# travessão (–) e as aspas curvas (“ ”) viram "¿" já no PDF (o "¿" aparece
+# impresso na própria página, não é falha da leitura). Aqui o caractere é
+# restaurado pelo contexto: colado ao início de uma palavra → aspas de
+# abertura; colado ao fim de uma palavra/pontuação → aspas de fechamento;
+# solto entre espaços (ou fim de linha) → travessão.
+_RE_ABRE_ASPAS = re.compile(r"(?:(?<=^)|(?<=[\s(\[]))¿(?=\w)")
+_RE_FECHA_ASPAS = re.compile(r"(?<=[\w.,;:)\]%])¿(?!\w)")
+
+
+def _fix_encoding_chars(text):
+    if not isinstance(text, str) or "¿" not in text:
+        return text
+    text = _RE_ABRE_ASPAS.sub("“", text)
+    text = _RE_FECHA_ASPAS.sub("”", text)
+    return text.replace("¿", "–")
+
+
+def _fix_encoding_deep(obj):
+    """Aplica _fix_encoding_chars em todas as strings de dicts/listas."""
+    if isinstance(obj, str):
+        return _fix_encoding_chars(obj)
+    if isinstance(obj, dict):
+        return {k: _fix_encoding_deep(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_fix_encoding_deep(v) for v in obj]
+    return obj
+
+
 def extract_rga_data(file_obj):
     """
     Retorna (meta_geral_dict, [meta_especifica_dict, ...]).
@@ -1453,7 +1483,7 @@ def extract_rga_data(file_obj):
         for m in metas:
             m["bens"] = "\n\n".join(bens.get(m["numero"], []))
 
-    return meta_geral, metas
+    return _fix_encoding_deep(meta_geral), _fix_encoding_deep(metas)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
