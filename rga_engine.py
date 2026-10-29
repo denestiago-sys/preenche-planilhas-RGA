@@ -73,6 +73,64 @@ _ALCANCE_OPCOES = [
 # UTILITÁRIOS DE LEITURA DE PDF
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ─── Cabeçalho/rodapé do navegador ─────────────────────────────────────────
+# Quando o PDF é salvo pelo navegador (Imprimir → Salvar como PDF) com a
+# opção "Cabeçalhos e rodapés" marcada, CADA página ganha no topo
+# "29/10/2026, 15:20  Relatório de Gestão" e no rodapé o endereço da página
+# ("https://apps.mj.gov.br/...&session=...") seguido de "N/115". Esse texto
+# cai dentro das células de "Itens Adquiridos" e vai parar na tabela final.
+# A mesma planilha gerada a partir do PDF sem essas faixas sai limpa — por
+# isso o resultado muda de um computador para outro: depende de como o PDF
+# foi salvo, não do programa. Aqui as faixas são detectadas na 1ª página e
+# removidas de todas (só se existirem; PDF sem elas passa intacto).
+_RE_DATA_HORA = re.compile(r"\d{1,2}/\d{1,2}/\d{4},?")
+_RE_HORA = re.compile(r"\d{1,2}:\d{2}")
+
+
+def _detect_print_bands(page):
+    """Devolve (header_bottom, footer_top); None onde não houver faixa."""
+    words = page.extract_words()
+    h = page.height
+    header_bottom = footer_top = None
+    for i, w in enumerate(words):
+        if (header_bottom is None and w["top"] < h * 0.10
+                and _RE_DATA_HORA.fullmatch(w["text"])
+                and i + 1 < len(words)
+                and _RE_HORA.fullmatch(words[i + 1]["text"])
+                and abs(words[i + 1]["top"] - w["top"]) < 2):
+            header_bottom = w["bottom"] + 1
+        if (footer_top is None and w["top"] > h * 0.88
+                and re.match(r"https?://", w["text"])):
+            footer_top = w["top"] - 1
+    return header_bottom, footer_top
+
+
+class _PdfView:
+    """Visão do PDF cujas páginas já vêm sem o cabeçalho/rodapé do
+    navegador (quando existirem). Expõe `.pages` como o pdfplumber."""
+
+    def __init__(self, pdf):
+        self._pdf = pdf
+        pages = list(pdf.pages)
+        hb = ft = None
+        if pages:
+            hb, ft = _detect_print_bands(pages[0])
+        if hb is not None or ft is not None:
+            def keep(obj, hb=hb, ft=ft):
+                if obj.get("object_type") != "char":
+                    return True
+                if hb is not None and obj["top"] < hb:
+                    return False
+                if ft is not None and obj["top"] >= ft:
+                    return False
+                return True
+            pages = [p.filter(keep) for p in pages]
+        self.pages = pages
+
+    def __getattr__(self, name):
+        return getattr(self._pdf, name)
+
+
 def extract_lines_from_rga_file(file_obj):
     """Extrai texto 'corrido' de cada página (usado apenas para checar se há
     texto selecionável no PDF enviado)."""
@@ -83,7 +141,8 @@ def extract_lines_from_rga_file(file_obj):
         open_arg = str(file_obj)
 
     pages = []
-    with pdfplumber.open(open_arg) as pdf:
+    with pdfplumber.open(open_arg) as raw_pdf:
+        pdf = _PdfView(raw_pdf)
         for page in pdf.pages:
             pages.append(page.extract_text() or "")
     return pages
@@ -1477,8 +1536,17 @@ _RE_ABRE_ASPAS = re.compile(r"(?:(?<=^)|(?<=[\s(\[]))¿(?=\w)")
 _RE_FECHA_ASPAS = re.compile(r"(?<=[\w.,;:)\]%])¿(?!\w)")
 
 
+# Faixa "AMBIENTE DE PRODUÇÃO" que o sistema desenha sobre as páginas (aparece
+# truncada, "AMBIENTE DE PRODUÇ…") e que o texto extraído às vezes arrasta
+# para o fim de uma célula/parágrafo.
+_RE_FAIXA_AMBIENTE = re.compile(r"\s*AMBIENTE DE PRODUÇ(?:…|ÃO)")
+
+
 def _fix_encoding_chars(text):
-    if not isinstance(text, str) or "¿" not in text:
+    if not isinstance(text, str):
+        return text
+    text = _RE_FAIXA_AMBIENTE.sub("", text).strip() if "AMBIENTE DE PRODUÇ" in text else text
+    if "¿" not in text:
         return text
     text = _RE_ABRE_ASPAS.sub("“", text)
     text = _RE_FECHA_ASPAS.sub("”", text)
@@ -1507,7 +1575,8 @@ def extract_rga_data(file_obj):
     else:
         open_arg = str(file_obj)
 
-    with pdfplumber.open(open_arg) as pdf:
+    with pdfplumber.open(open_arg) as raw_pdf:
+        pdf = _PdfView(raw_pdf)
         if not pdf.pages:
             return None, []
 
