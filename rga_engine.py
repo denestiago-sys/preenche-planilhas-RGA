@@ -346,6 +346,23 @@ def _extract_meta_geral(pdf):
     meta_page_idx = _find_page_with_text(pdf, "Avaliação da Meta Geral")
     p2 = pdf.pages[meta_page_idx] if meta_page_idx is not None else None
     words2 = p2.extract_words() if p2 else []
+    # Os campos 1.2 a 1.4 podem cair numa página DEPOIS da que traz o título
+    # "1. Avaliação da Meta Geral" (quando a justificativa 1.1 é longa).
+    # Por isso cada campo é procurado em todas as páginas da seção 1.
+    sec_pages = []
+    if meta_page_idx is not None:
+        for _pi in range(meta_page_idx, min(meta_page_idx + 8, len(pdf.pages))):
+            sec_pages.append((pdf.pages[_pi], pdf.pages[_pi].extract_words()))
+            _tx = pdf.pages[_pi].extract_text() or ""
+            if re.search(r"2\.\s*Desempenho\s+das\s+Metas\s+Específicas", _tx):
+                break
+
+    def _find_sec(seq):
+        for _pg, _ws in sec_pages:
+            _i = _seq_pos(_ws, seq)
+            if _i is not None:
+                return _pg, _ws, _i
+        return None, [], None
     # "1.5. Observações complementares" pode ser um texto longo que
     # continua na(s) página(s) seguinte(s) — uma só página não basta.
     # Junta o texto de meta_page_idx em diante até (e incluindo) a
@@ -368,13 +385,14 @@ def _extract_meta_geral(pdf):
     polaridade = pol_m.group(1) if pol_m else ""
 
     sinesp = ""
-    sin_label = _seq_pos(words2, ["Sinesp?"])
+    p_sin, words_sin, sin_label = _find_sec(["Sinesp?"])
     if sin_label is not None:
-        top_bound = words2[sin_label]["top"]
+        words2_s, p2_s = words_sin, p_sin
+        top_bound = words2_s[sin_label]["top"]
         bottom_bound = top_bound + 20
-        sim_pos = next((w for w in words2 if w["text"] == "Sim"
+        sim_pos = next((w for w in words2_s if w["text"] == "Sim"
                          and top_bound <= w["top"] <= bottom_bound), None)
-        nao_pos = next((w for w in words2 if w["text"] == "Não"
+        nao_pos = next((w for w in words2_s if w["text"] == "Não"
                          and top_bound <= w["top"] <= bottom_bound), None)
         rows = []
         if sim_pos:
@@ -382,7 +400,7 @@ def _extract_meta_geral(pdf):
         if nao_pos:
             rows.append(("NÃO", nao_pos["x0"]))
         marker_x0 = None
-        for c in p2.curves:
+        for c in p2_s.curves:
             if not c.get("fill"):
                 continue
             color = c.get("non_stroking_color") or (1, 1, 1)
@@ -402,9 +420,10 @@ def _extract_meta_geral(pdf):
     # automático (1.4) não se aplicam; em seu lugar, o campo de texto livre
     # "Demonstre se o objetivo está sendo alcançado (obrigatório)" é
     # preenchido — ver _write_meta_geral, que mescla essas colunas.
+    _pc, _wc, _ = _find_sec(["Plano", "não", "possui", "Meta", "Geral", "mensurável"])
     sem_meta_mensuravel = _checkbox_marked(
-        words2, ["Plano", "não", "possui", "Meta", "Geral", "mensurável"]
-    )
+        _wc, ["Plano", "não", "possui", "Meta", "Geral", "mensurável"]
+    ) if _wc else False
 
     demonstre = _extract_paragraph_after(
         t2, r"Demonstre se o objetivo está sendo alcançado \(obrigatório\)",
@@ -420,26 +439,29 @@ def _extract_meta_geral(pdf):
         [r"\n\s*2\.\s"],
     )
 
-    idx = _seq_pos(words2, ["Valor", "de", "Referência", "(Apresentado"])
-    val_ref_p = _value_below(words2, idx)
+    _pv, _wv, idx = _find_sec(["Valor", "de", "Referência", "(Apresentado"])
+    val_ref_p = _value_below(_wv, idx)
 
-    idx = _seq_pos(words2, ["Valor", "de", "Referência", "(Monitorado"])
-    val_ref_mon = _value_below(words2, idx)
+    _pv, _wv, idx = _find_sec(["Valor", "de", "Referência", "(Monitorado"])
+    val_ref_mon = _value_below(_wv, idx)
 
-    idx = _seq_pos(words2, ["Valor/Alcance", "da", "Meta", "Geral"])
-    val_alc = _value_below(words2, idx)
+    _pv, _wv, idx = _find_sec(["Valor/Alcance", "da", "Meta", "Geral"])
+    val_alc = _value_below(_wv, idx)
 
     resultado = ""
-    marco_14 = _word_top(p2, "1.4.", contains=False) if p2 else None
-    marco_15 = _word_top(p2, "1.5.", contains=False) if p2 else None
-    if marco_14:
+    for _pg, _ in sec_pages:
+        marco_14 = _word_top(_pg, "1.4.", contains=False)
+        if not marco_14:
+            continue
+        marco_15 = _word_top(_pg, "1.5.", contains=False)
         top_bound = marco_14[1]
-        bottom_bound = marco_15[1] if marco_15 else top_bound + 110
-        rows = _alcance_option_rows(p2, top_bound, bottom_bound)
+        bottom_bound = marco_15[1] if marco_15 else _pg.height
+        rows = _alcance_option_rows(_pg, top_bound, bottom_bound)
         if rows:
-            sel = _detect_selected_option(p2, top_bound, bottom_bound, rows)
+            sel = _detect_selected_option(_pg, top_bound, bottom_bound, rows)
             if sel:
                 resultado = sel
+        break
 
     # TODO: "Indicador da Meta Geral" e "Fonte dos Dados" são campos novos
     # do template (set/2026) que ainda não têm extração implementada — o
@@ -522,6 +544,17 @@ def _alcance_option_rows(page, top_bound, bottom_bound):
             first = w["top"] if first is None else min(first, w["top"])
         if w["text"] == "Não":
             last = w["top"] if last is None else max(last, w["top"])
+    # "Não se aplica" é a última opção; se houver outros "Não" abaixo (texto
+    # da justificativa), usa o que vem logo após "100%" e é seguido de "se".
+    if first is not None:
+        _ws = [w for w in page.extract_words()
+               if top_bound <= w["top"] <= bottom_bound]
+        for k, w in enumerate(_ws[:-1]):
+            if (w["text"] == "Não" and w["top"] > first
+                    and _ws[k + 1]["text"] == "se"
+                    and abs(_ws[k + 1]["top"] - w["top"]) < 2):
+                last = w["top"]
+                break
     if first is None or last is None:
         return None
     step = (last - first) / 4.0
@@ -566,7 +599,10 @@ def _seq_pos(words, seq, min_top=0, x_tol=6):
     for i in range(len(words)):
         if words[i]["top"] < min_top:
             continue
-        if not _word_matches(words[i]["text"], seq[0]):
+        # A PRIMEIRA palavra exige igualdade exata (senão "Valores" casaria
+        # com "Valor"); as seguintes toleram truncamento.
+        if not (_word_matches(words[i]["text"], seq[0]) if n == 1
+                else words[i]["text"] == seq[0]):
             continue
         anchor_x0 = words[i]["x0"]
         cur = words[i]
@@ -578,7 +614,8 @@ def _seq_pos(words, seq, min_top=0, x_tol=6):
                  and 0 <= w["x0"] - cur["x1"] < 40),
                 key=lambda w: w["x0"],
             )
-            nxt = same_line[0] if same_line and _word_matches(
+            _m = _word_matches
+            nxt = same_line[0] if same_line and _m(
                 same_line[0]["text"], seq[j]) else None
             if nxt is None:
                 wrapped = sorted(
@@ -587,7 +624,7 @@ def _seq_pos(words, seq, min_top=0, x_tol=6):
                      and abs(w["x0"] - anchor_x0) <= x_tol),
                     key=lambda w: w["top"],
                 )
-                if wrapped and _word_matches(wrapped[0]["text"], seq[j]):
+                if wrapped and _m(wrapped[0]["text"], seq[j]):
                     nxt = wrapped[0]
             if nxt is None:
                 ok = False
