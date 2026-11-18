@@ -522,7 +522,7 @@ def _detect_selected_option(page, top_bound, bottom_bound, rows):
             continue  # preenchimento branco de fundo, não é a marcação
         w = c["x1"] - c["x0"]
         h = c["bottom"] - c["top"]
-        if w < 10 and h < 10 and top_bound <= c["top"] <= bottom_bound:
+        if 5 <= w < 10 and 5 <= h < 10 and top_bound <= c["top"] <= bottom_bound:
             marker_top = c["top"]
             break
     if marker_top is None:
@@ -532,34 +532,39 @@ def _detect_selected_option(page, top_bound, bottom_bound, rows):
 
 
 def _alcance_option_rows(page, top_bound, bottom_bound):
-    """Deduz a posição (top) de cada uma das 5 opções padrão de alcance
-    (100%/75-99%/50-74%/Abaixo de 50%/Não se aplica) dentro da faixa vertical
-    indicada, usando a primeira ('100%') e a última ('Não') como âncoras —
-    evita depender de coordenadas fixas, que variam de relatório pra relatório."""
-    first = last = None
-    for w in page.extract_words():
-        if not (top_bound <= w["top"] <= bottom_bound):
-            continue
-        if w["text"] == "100%":
-            first = w["top"] if first is None else min(first, w["top"])
-        if w["text"] == "Não":
-            last = w["top"] if last is None else max(last, w["top"])
-    # "Não se aplica" é a última opção; se houver outros "Não" abaixo (texto
-    # da justificativa), usa o que vem logo após "100%" e é seguido de "se".
-    if first is not None:
-        _ws = [w for w in page.extract_words()
-               if top_bound <= w["top"] <= bottom_bound]
-        for k, w in enumerate(_ws[:-1]):
-            if (w["text"] == "Não" and w["top"] > first
-                    and _ws[k + 1]["text"] == "se"
-                    and abs(_ws[k + 1]["top"] - w["top"]) < 2):
-                last = w["top"]
-                break
-    if first is None or last is None:
+    """Posição (top) de cada opção de alcance dentro da faixa vertical
+    indicada, lendo o PRÓPRIO TEXTO de cada opção: "100%", "75%",
+    "50% a 74%", "Abaixo de 50%" e "Não se aplica". A lista varia entre
+    relatórios — as metas COM indicador mensurável têm só 4 opções (sem
+    "Não se aplica"), e a Meta Geral pode ter 5 — então nunca se deve
+    assumir um número fixo de linhas."""
+    ws = [w for w in page.extract_words() if top_bound <= w["top"] <= bottom_bound]
+    ws.sort(key=lambda w: (round(w["top"]), w["x0"]))
+
+    def nxt(k):
+        if k + 1 < len(ws) and abs(ws[k + 1]["top"] - ws[k]["top"]) < 2:
+            return ws[k + 1]["text"]
+        return ""
+
+    found = {}
+    for k, w in enumerate(ws):
+        t = w["text"]
+        lab = None
+        if t == "100%":
+            lab = _ALCANCE_OPCOES[0]
+        elif t == "75%":
+            lab = _ALCANCE_OPCOES[1]
+        elif t == "50%" and nxt(k) == "a":
+            lab = _ALCANCE_OPCOES[2]
+        elif t == "Abaixo":
+            lab = _ALCANCE_OPCOES[3]
+        elif t == "Não" and nxt(k) == "se":
+            lab = _ALCANCE_OPCOES[4]
+        if lab and lab not in found:
+            found[lab] = w["top"]
+    if len(found) < 3 or _ALCANCE_OPCOES[0] not in found:
         return None
-    step = (last - first) / 4.0
-    tops = [first + i * step for i in range(5)]
-    return list(zip(_ALCANCE_OPCOES, tops))
+    return [(l, found[l]) for l in _ALCANCE_OPCOES if l in found]
 
 
 def _word_matches(actual, expected):
@@ -905,7 +910,7 @@ def _extract_meta_especifica_avaliacao(pdf, num, page_idx, title_top, next_top_p
         resultado = "Não se aplica"
     elif resultado_word:
         top_bound = resultado_word[1]
-        bottom_bound = top_bound + 100
+        bottom_bound = min(top_bound + 160, page.height)
         rows = _alcance_option_rows(page, top_bound, bottom_bound)
         if rows:
             sel = _detect_selected_option(page, top_bound, bottom_bound, rows)
