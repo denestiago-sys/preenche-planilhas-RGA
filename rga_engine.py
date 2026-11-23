@@ -449,19 +449,32 @@ def _extract_meta_geral(pdf):
     val_alc = _value_below(_wv, idx)
 
     resultado = ""
-    for _pg, _ in sec_pages:
-        marco_14 = _word_top(_pg, "1.4.", contains=False)
-        if not marco_14:
-            continue
-        marco_15 = _word_top(_pg, "1.5.", contains=False)
-        top_bound = marco_14[1]
-        bottom_bound = marco_15[1] if marco_15 else _pg.height
-        rows = _alcance_option_rows(_pg, top_bound, bottom_bound)
-        if rows:
-            sel = _detect_selected_option(_pg, top_bound, bottom_bound, rows)
-            if sel:
-                resultado = sel
-        break
+    # As opções de 1.4 podem ficar divididas entre duas páginas (ex.: "100%"
+    # e "75%" no fim de uma, o resto — inclusive a opção MARCADA — no começo
+    # da seguinte). Por isso a leitura continua nas páginas seguintes até
+    # achar a marcação ou chegar em "1.5.".
+    _start = None
+    for _k, (_pg, _) in enumerate(sec_pages):
+        if _word_top(_pg, "1.4.", contains=False):
+            _start = _k
+            break
+    if _start is not None:
+        for _k in range(_start, min(_start + 3, len(sec_pages))):
+            _pg = sec_pages[_k][0]
+            if _k == _start:
+                top_bound = _word_top(_pg, "1.4.", contains=False)[1]
+            else:
+                top_bound = 0
+            marco_15 = _word_top(_pg, "1.5.", contains=False)
+            bottom_bound = marco_15[1] if marco_15 else _pg.height
+            rows = _alcance_option_rows(_pg, top_bound, bottom_bound)
+            if rows:
+                sel = _detect_selected_option(_pg, top_bound, bottom_bound, rows)
+                if sel:
+                    resultado = sel
+                    break
+            if marco_15:
+                break
 
     # TODO: "Indicador da Meta Geral" e "Fonte dos Dados" são campos novos
     # do template (set/2026) que ainda não têm extração implementada — o
@@ -562,7 +575,7 @@ def _alcance_option_rows(page, top_bound, bottom_bound):
             lab = _ALCANCE_OPCOES[4]
         if lab and lab not in found:
             found[lab] = w["top"]
-    if len(found) < 3 or _ALCANCE_OPCOES[0] not in found:
+    if not found:
         return None
     return [(l, found[l]) for l in _ALCANCE_OPCOES if l in found]
 
